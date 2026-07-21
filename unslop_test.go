@@ -795,7 +795,7 @@ func TestCoverageFinalPushAudit(t *testing.T) {
 	os.Chtimes(staleFile, oldTime, oldTime)
 
 	engine := NewRuleEngine(getDefaultManifest())
-	_ = scanParallel([]string{"/tmp", staleFile}, engine, 2.0, 100*1024, true)
+	_ = scanParallel([]string{tmpDir, staleFile}, engine, 2.0, 100*1024, true)
 
 	mockFI := mockFileInfo{}
 	atime, ctime, uid, isPosix := getStatTimes(mockFI)
@@ -876,14 +876,20 @@ func TestActual12kCandidateScan(t *testing.T) {
 
 	for i := 1; i <= 12000; i++ {
 		sub := filepath.Join(tmpDir, fmt.Sprintf("sub_%d", (i-1)/1000))
-		os.MkdirAll(sub, 0755)
+		if err := os.MkdirAll(sub, 0755); err != nil {
+			t.Fatalf("Failed to create test directory %s: %v", sub, err)
+		}
 		p := filepath.Join(sub, fmt.Sprintf("stale_%d.log", i))
-		os.WriteFile(p, bytes.Repeat([]byte("a"), 200*1024), 0644)
-		os.Chtimes(p, oldTime, oldTime)
+		if err := os.WriteFile(p, []byte("a"), 0644); err != nil {
+			t.Fatalf("Failed to create test file %s: %v", p, err)
+		}
+		if err := os.Chtimes(p, oldTime, oldTime); err != nil {
+			t.Fatalf("Failed to set modtime for %s: %v", p, err)
+		}
 	}
 
 	engine := NewRuleEngine(getDefaultManifest())
-	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, true)
+	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 0, true)
 
 	if len(candidates) != 12000 {
 		t.Errorf("scanParallel on 12,000 files expected 12,000 candidates; got %d", len(candidates))
@@ -1475,7 +1481,7 @@ func TestCoveragePushTo95Final(t *testing.T) {
 	os.Chtimes(staleLog, oldTime, oldTime)
 
 	engine := NewRuleEngine(getDefaultManifest())
-	_ = scanParallel([]string{"/tmp", tmpSubDir}, engine, 2.0, 100*1024, true)
+	_ = scanParallel([]string{tmpSubDir}, engine, 2.0, 100*1024, true)
 
 	var stdout, stderr bytes.Buffer
 	runMain([]string{"-json", "-plan-out", "/non/existent/dir/999/plan.json", "-path", tmpSubDir}, &stdout, &stderr, nil)
