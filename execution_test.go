@@ -871,3 +871,25 @@ func TestPythonVenvRuleRequiresPyvenvCfg(t *testing.T) {
 		t.Errorf("Directory venv with pyvenv.cfg must be matched as python_venv!")
 	}
 }
+
+func TestPackageRegistryExclusionAndRecentAtimeSafety(t *testing.T) {
+	if !isPackageRegistryInternalPath("/home/user/.cargo/registry/src/index.crates.io-123/gdextension-api-0.1.0/api.json") {
+		t.Errorf("Expected isPackageRegistryInternalPath to return true for Cargo registry file")
+	}
+
+	tmpDir := t.TempDir()
+	cargoFile := filepath.Join(tmpDir, ".cargo", "registry", "src", "gdextension.json")
+	os.MkdirAll(filepath.Dir(cargoFile), 0755)
+	os.WriteFile(cargoFile, []byte(strings.Repeat("B", 6*1024*1024)), 0644)
+
+	// Verify scanParallel ignores single files inside .cargo/registry
+	manifest, _ := loadManifest("manifest.json")
+	engine := NewRuleEngine(manifest)
+
+	cands := scanParallel([]string{tmpDir}, engine, 7.0, 0, true)
+	for _, c := range cands {
+		if strings.Contains(c.Path, ".cargo/registry") {
+			t.Errorf("Single file inside package registry should not be scanned as candidate: %s", c.Path)
+		}
+	}
+}

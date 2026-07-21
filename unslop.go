@@ -608,6 +608,35 @@ func isProtected(path string) bool {
 	return false
 }
 
+func isPackageRegistryInternalPath(path string) bool {
+	pathClean := filepath.ToSlash(path)
+	return strings.Contains(pathClean, "/.cargo/registry/") ||
+		strings.Contains(pathClean, "/.cargo/git/") ||
+		strings.Contains(pathClean, "/.local/pipx/") ||
+		strings.Contains(pathClean, "/.npm/") ||
+		strings.Contains(pathClean, "/.cache/pypoetry/") ||
+		strings.Contains(pathClean, "/.cache/yarn/") ||
+		strings.Contains(pathClean, "/.gradle/caches/")
+}
+
+func getEffectiveItemTime(info os.FileInfo) time.Time {
+	mtime := info.ModTime()
+	if mtime.Before(time.Date(2010, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		atime, ctime, _, isPosix := getStatTimes(info)
+		if isPosix {
+			best := mtime
+			if !atime.IsZero() && atime.After(best) {
+				best = atime
+			}
+			if !ctime.IsZero() && ctime.After(best) {
+				best = ctime
+			}
+			return best
+		}
+	}
+	return mtime
+}
+
 func containsProtectedPath(targetPath string) bool {
 	var foundProtected bool
 	err := filepath.WalkDir(targetPath, func(p string, d os.DirEntry, err error) error {
@@ -882,8 +911,10 @@ func inspectDirectorySubtree(dirPath string, now time.Time) (size int64, maxModT
 		}
 		fileCount++
 		size += info.Size()
-		if info.ModTime().After(maxModTime) {
-			maxModTime = info.ModTime()
+
+		itemTime := getEffectiveItemTime(info)
+		if itemTime.After(maxModTime) {
+			maxModTime = itemTime
 		}
 		return nil
 	})
@@ -1378,6 +1409,9 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 						}
 					}
 				} else if !d.IsDir() {
+					if isPackageRegistryInternalPath(p) {
+						return nil
+					}
 					info, err := d.Info()
 					if err != nil {
 						return nil
@@ -1400,7 +1434,11 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 
 						act, canDel := determineCandidateAction(rule, false, uninstallArgs, includeData, false)
 
-						ageDays := now.Sub(info.ModTime()).Hours() / 24.0
+						lastActivity := getEffectiveItemTime(info)
+						ageDays := now.Sub(lastActivity).Hours() / 24.0
+						if ageDays < 0 {
+							ageDays = 0
+						}
 
 						if ageDays >= minDays && sz >= reqMinSize {
 							cand := Candidate{
@@ -1411,15 +1449,15 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 								RuleID:         rule.ID,
 								RiskClass:      rule.RiskClass,
 								Reason:         fmt.Sprintf("%s (stale for %.1fd, %s)", rule.Name, ageDays, formatBytes(sz)),
-								Evidence:       fmt.Sprintf("Last modified %.1fd ago (%s)", ageDays, info.ModTime().Format("2006-01-02")),
+								Evidence:       fmt.Sprintf("Last activity %.1fd ago (%s)", ageDays, lastActivity.Format("2006-01-02")),
 								ProposedAction: act,
 								CanDelete:      canDel,
 								IsDir:          false,
 								FileCount:      1,
 								PackageName:    pkgName,
 								UninstallArgs:  uninstallArgs,
-								ModTime:        info.ModTime(),
-								RootModTime:    info.ModTime(),
+								ModTime:        lastActivity,
+								RootModTime:    lastActivity,
 							}
 
 							candMu.Lock()
