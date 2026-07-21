@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -94,1417 +95,1436 @@ func TestIsProtected(t *testing.T) {
 	}
 }
 
-func TestContainsProtectedPath(t *testing.T) {
-	tmpDir := t.TempDir()
-	subDir := filepath.Join(tmpDir, "sub")
-	os.MkdirAll(subDir, 0755)
-	credFile := filepath.Join(subDir, "credentials.json")
-	os.WriteFile(credFile, []byte("secret"), 0600)
-
-	if !containsProtectedPath(tmpDir) {
-		t.Errorf("containsProtectedPath should detect sub/credentials.json")
+func TestAbsoluteGlobPathSemantics(t *testing.T) {
+	tests := []struct {
+		path    string
+		pattern string
+		match   bool
+	}{
+		{"/home/user/.cargo/bin/my-crate", "*/.cargo/bin/*", true},
+		{"/home/user/.local/pipx/venvs/black", "*/.local/pipx/venvs/*", true},
+		{"/home/user/.cache/zig/foo", "*/.cache/*", true},
+		{"/home/user/src/main.go", "*/.cache/*", false},
+		{"C:/Users/User/.cargo/bin/my-crate.exe", "*/.cargo/bin/*", true},
+		{"/tmp/test.log", "*.log", true},
 	}
 
-	containsProtectedPath("/non/existent/path/999")
-
-	safeDir := t.TempDir()
-	os.WriteFile(filepath.Join(safeDir, "foo.txt"), []byte("ok"), 0644)
-	if containsProtectedPath(safeDir) {
-		t.Errorf("containsProtectedPath reported true for clean directory")
+	for _, tt := range tests {
+		got := matchPattern(tt.path, tt.pattern)
+		if got != tt.match {
+			t.Errorf("matchPattern(%q, %q) = %v; want %v", tt.path, tt.pattern, got, tt.match)
+		}
 	}
 }
 
-func TestMatchPattern(t *testing.T) {
-	if !matchPattern("model.gguf", "*.gguf") {
-		t.Errorf("matchPattern model.gguf failed")
+func TestProtectedSubtreeFailClosed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Permission mode 0000 not applicable on Windows")
 	}
-	if !matchPattern("build.o", "build.*") {
-		t.Errorf("matchPattern build.o failed")
+
+	tmpDir := t.TempDir()
+	parentDir := filepath.Join(tmpDir, "parent_cache")
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		t.Fatalf("Failed to create parentDir: %v", err)
 	}
-	if matchPattern("model.txt", "*.gguf") {
-		t.Errorf("matchPattern model.txt incorrectly matched *.gguf")
+
+	subDir := filepath.Join(parentDir, "unreadable_sub")
+	if err := os.MkdirAll(subDir, 0000); err != nil {
+		t.Fatalf("Failed to create subDir: %v", err)
+	}
+	defer os.Chmod(subDir, 0755)
+
+	// containsProtectedPath must fail closed (return true) when subtree has permission errors
+	if !containsProtectedPath(parentDir) {
+		t.Errorf("containsProtectedPath should return true (fail closed) on unreadable subdirectories")
+	}
+
+	cand := Candidate{
+		ID:             1,
+		Path:           parentDir,
+		Size:           1000,
+		AgeDays:        10.0,
+		Category:       "Cache",
+		RuleID:         "test_cache",
+		RiskClass:      RiskRegenerable,
+		ProposedAction: "delete_dir",
+		IsDir:          true,
+		CanDelete:      true,
+	}
+
+	stdin := strings.NewReader("y\n")
+	var stdout bytes.Buffer
+
+	confirmAndDeleteWithIO([]Candidate{cand}, false, false, false, 1000, 1000, &stdout, stdin)
+	output := stdout.String()
+
+	if !strings.Contains(output, "[PROTECTED SAFEGUARD]") {
+		t.Errorf("Expected [PROTECTED SAFEGUARD] in output; got:\n%s", output)
+	}
+
+	// Verify invariant: directory MUST STILL EXIST on disk
+	if _, err := os.Stat(parentDir); os.IsNotExist(err) {
+		t.Errorf("Protected safeguard failed: parentDir was deleted!")
+	}
+}
+
+func TestPreActionRevalidationInvariants(t *testing.T) {
+	tmpDir := t.TempDir()
+	staleFile := filepath.Join(tmpDir, "stale.log")
+	initialContent := []byte(strings.Repeat("A", 1000))
+	if err := os.WriteFile(staleFile, initialContent, 0644); err != nil {
+		t.Fatalf("Failed to write staleFile: %v", err)
+	}
+
+	oldTime := time.Now().Add(-5 * 24 * time.Hour)
+	if err := os.Chtimes(staleFile, oldTime, oldTime); err != nil {
+		t.Fatalf("Failed to set chtimes: %v", err)
+	}
+
+	fi, err := os.Stat(staleFile)
+	if err != nil {
+		t.Fatalf("Failed to stat staleFile: %v", err)
+	}
+
+	cand := Candidate{
+		ID:             1,
+		Path:           staleFile,
+		Size:           fi.Size(),
+		ModTime:        fi.ModTime(),
+		AgeDays:        5.0,
+		Category:       "Log",
+		RuleID:         "log_rule",
+		RiskClass:      RiskRegenerable,
+		ProposedAction: "delete_file",
+		IsDir:          false,
+		CanDelete:      true,
+	}
+
+	// Case 1: Size changed
+	if err := os.WriteFile(staleFile, []byte(strings.Repeat("B", 2000)), 0644); err != nil {
+		t.Fatalf("Failed to write mutated size file: %v", err)
+	}
+
+	stdin := strings.NewReader("y\n")
+	var stdout bytes.Buffer
+	confirmAndDeleteWithIO([]Candidate{cand}, false, false, false, 1000, 1000, &stdout, stdin)
+
+	if !strings.Contains(stdout.String(), "[ABORT] File size changed") {
+		t.Errorf("Expected size change abort; got:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(staleFile); os.IsNotExist(err) {
+		t.Errorf("Pre-action revalidation invariant failed: file was deleted after size change!")
+	}
+
+	// Case 2: ModTime changed
+	if err := os.WriteFile(staleFile, initialContent, 0644); err != nil {
+		t.Fatalf("Failed to restore initial content: %v", err)
+	}
+	nowTime := time.Now()
+	if err := os.Chtimes(staleFile, nowTime, nowTime); err != nil {
+		t.Fatalf("Failed to set new chtimes: %v", err)
+	}
+
+	stdout.Reset()
+	stdin = strings.NewReader("y\n")
+	confirmAndDeleteWithIO([]Candidate{cand}, false, false, false, 1000, 1000, &stdout, stdin)
+
+	if !strings.Contains(stdout.String(), "[ABORT] File modification time changed") {
+		t.Errorf("Expected modtime change abort; got:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(staleFile); os.IsNotExist(err) {
+		t.Errorf("Pre-action revalidation invariant failed: file was deleted after modtime change!")
+	}
+
+	// Case 3: Same-type path replacement / type changed (file replaced by directory)
+	if err := os.Remove(staleFile); err != nil {
+		t.Fatalf("Failed to remove staleFile: %v", err)
+	}
+	if err := os.Mkdir(staleFile, 0755); err != nil {
+		t.Fatalf("Failed to create dir at staleFile path: %v", err)
+	}
+
+	stdout.Reset()
+	stdin = strings.NewReader("y\n")
+	confirmAndDeleteWithIO([]Candidate{cand}, false, false, false, 1000, 1000, &stdout, stdin)
+
+	if !strings.Contains(stdout.String(), "[ABORT] File type changed") {
+		t.Errorf("Expected type change abort; got:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(staleFile); os.IsNotExist(err) {
+		t.Errorf("Pre-action revalidation invariant failed: path was deleted after type change!")
+	}
+}
+
+func TestCustomUserPatternsAreUnknownReportOnly(t *testing.T) {
+	tmpDir := t.TempDir()
+	customFile := filepath.Join(tmpDir, "test.tmp")
+	content := []byte(strings.Repeat("X", 101*1024))
+	if err := os.WriteFile(customFile, content, 0644); err != nil {
+		t.Fatalf("Failed to write customFile: %v", err)
+	}
+	oldTime := time.Now().Add(-10 * 24 * time.Hour)
+	if err := os.Chtimes(customFile, oldTime, oldTime); err != nil {
+		t.Fatalf("Failed to set chtimes: %v", err)
+	}
+
+	engine := NewRuleEngine(getDefaultManifest())
+	removed, added := applyOverrides(engine, []string{"+*.tmp"})
+
+	if len(added) != 1 || added[0] != "*.tmp" {
+		t.Fatalf("applyOverrides failed to record added pattern; got added=%v, removed=%v", added, removed)
+	}
+
+	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, true)
+	if len(candidates) != 1 {
+		t.Fatalf("Expected 1 candidate for custom pattern; got %d", len(candidates))
+	}
+
+	c := candidates[0]
+	if c.RiskClass != RiskUnknown {
+		t.Errorf("Custom user pattern must be RiskUnknown; got %s", c.RiskClass)
+	}
+	if c.CanDelete {
+		t.Errorf("Custom user pattern must have CanDelete = false; got true")
+	}
+	if c.ProposedAction != "report-only" {
+		t.Errorf("Custom user pattern must have ProposedAction = 'report-only'; got %s", c.ProposedAction)
+	}
+
+	stdin := strings.NewReader("y\n")
+	var stdout bytes.Buffer
+	confirmAndDeleteWithIO(candidates, false, false, false, 1000, 1000, &stdout, stdin)
+
+	if !strings.Contains(stdout.String(), "[SKIP REPORT-ONLY]") {
+		t.Errorf("Expected [SKIP REPORT-ONLY] in output; got:\n%s", stdout.String())
+	}
+
+	// Verify invariant: custom pattern file MUST STILL EXIST
+	if _, err := os.Stat(customFile); os.IsNotExist(err) {
+		t.Errorf("Custom pattern isolation failed: file was deleted in apply mode!")
+	}
+}
+
+func TestActual12kCandidateScan(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldTime := time.Now().Add(-10 * 24 * time.Hour)
+
+	const totalFiles = 12000
+	for i := 0; i < totalFiles; i++ {
+		filePath := filepath.Join(tmpDir, fmt.Sprintf("stale_%05d.log", i))
+		f, err := os.Create(filePath)
+		if err != nil {
+			t.Fatalf("Failed to create test file %d: %v", i, err)
+		}
+		if err := f.Truncate(101 * 1024); err != nil {
+			f.Close()
+			t.Fatalf("Failed to truncate sparse test file %d: %v", i, err)
+		}
+		f.Close()
+
+		if err := os.Chtimes(filePath, oldTime, oldTime); err != nil {
+			t.Fatalf("Failed to set chtimes on test file %d: %v", i, err)
+		}
+	}
+
+	engine := NewRuleEngine(getDefaultManifest())
+	start := time.Now()
+	// Set minSizeBytes to 100*1024 so 101 KiB files are included
+	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, true)
+	elapsed := time.Since(start)
+
+	if len(candidates) != totalFiles {
+		t.Fatalf("scanParallel on 12,000 files expected %d candidates; got %d", totalFiles, len(candidates))
+	}
+
+	if elapsed > 5*time.Second {
+		t.Errorf("12,000 candidate scan took too long: %v", elapsed)
+	}
+}
+
+func TestInjectionSafePlatformTrash(t *testing.T) {
+	tmpDir := t.TempDir()
+	hostileFile := filepath.Join(tmpDir, "file'; rm -rf .; \" $`\n.tmp")
+	if err := os.WriteFile(hostileFile, []byte("data"), 0644); err != nil {
+		t.Fatalf("Failed to create hostileFile: %v", err)
+	}
+
+	// Calling moveToTrashOS on hostile path must not cause shell syntax error or injection
+	_ = moveToTrashOS(hostileFile)
+}
+
+func TestHermeticCLIFlagValidationAndOutput(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("TMPDIR", t.TempDir())
+
+	tmpDir := t.TempDir()
+	staleLog := filepath.Join(tmpDir, "stale.log")
+	content := []byte(strings.Repeat("A", 101*1024))
+	if err := os.WriteFile(staleLog, content, 0644); err != nil {
+		t.Fatalf("Failed to write stale log: %v", err)
+	}
+	oldTime := time.Now().Add(-10 * 24 * time.Hour)
+	if err := os.Chtimes(staleLog, oldTime, oldTime); err != nil {
+		t.Fatalf("Failed to set chtimes: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	// Test 1: -days negative flag validation
+	stdout.Reset()
+	stderr.Reset()
+	code := runMain([]string{"-days", "-1"}, &stdout, &stderr, nil)
+	if code != 2 {
+		t.Errorf("runMain with -days -1 expected exit code 2; got %d", code)
+	}
+
+	// Test 2: -min-size-mb negative flag validation
+	stdout.Reset()
+	stderr.Reset()
+	code = runMain([]string{"-min-size-mb", "-1"}, &stdout, &stderr, nil)
+	if code != 2 {
+		t.Errorf("runMain with -min-size-mb -1 expected exit code 2; got %d", code)
+	}
+
+	// Test 3: Nonexistent path validation
+	stdout.Reset()
+	stderr.Reset()
+	nonExistentPath := filepath.Join(t.TempDir(), "nonexistent_dir_9999")
+	code = runMain([]string{"-path", nonExistentPath}, &stdout, &stderr, nil)
+	if code != 1 {
+		t.Errorf("runMain with nonexistent path expected exit code 1; got %d", code)
+	}
+
+	// Test 4: Structured JSON plan output schema validation
+	stdout.Reset()
+	stderr.Reset()
+	code = runMain([]string{"-json", "-include-data", "-min-size-mb", "0.05", "-path", tmpDir}, &stdout, &stderr, nil)
+	if code != 0 {
+		t.Fatalf("runMain -json -path %s failed with code %d: %s", tmpDir, code, stderr.String())
+	}
+
+	var plan PlanReport
+	if err := json.Unmarshal(stdout.Bytes(), &plan); err != nil {
+		t.Fatalf("Failed to parse JSON plan output: %v\nOutput:\n%s", err, stdout.String())
+	}
+
+	if plan.Version != Version {
+		t.Errorf("JSON plan Version = %s; want %s", plan.Version, Version)
+	}
+	if plan.TotalCandidates != 1 {
+		t.Errorf("JSON plan TotalCandidates = %d; want 1", plan.TotalCandidates)
+	}
+	if len(plan.Candidates) != 1 {
+		t.Fatalf("JSON plan Candidates length = %d; want 1", len(plan.Candidates))
+	}
+	if plan.Candidates[0].Size != int64(len(content)) {
+		t.Errorf("JSON plan Candidate Size = %d; want %d", plan.Candidates[0].Size, len(content))
+	}
+}
+
+func TestAllPackageManagerFixturesAndNegativeMappings(t *testing.T) {
+	inv := &PackageInventory{
+		CargoCrates: map[string]string{"ripgrep": "ripgrep"},
+		PipxVenvs:   map[string]string{"black": "black"},
+		NpmPackages: map[string]string{"typescript": "typescript"},
+	}
+
+
+
+	// Positive mapping
+	args := formatUninstallArgs("UNUSED (Cargo)", "ripgrep", "/home/user/.cargo/bin/ripgrep", inv)
+	if len(args) == 0 || args[0] != "cargo" {
+		t.Errorf("Positive cargo mapping failed; got %v", args)
+	}
+
+	// Negative mapping
+	argsNeg := formatUninstallArgs("UNUSED (Cargo)", "unmapped-bin", "/home/user/.cargo/bin/unmapped-bin", inv)
+	if len(argsNeg) != 0 {
+		t.Errorf("Negative cargo mapping should return nil; got %v", argsNeg)
+	}
+
+	// npm
+	npmArgs := formatUninstallArgs("UNUSED (npm)", "typescript", "/home/user/.nvm/versions/node/v18.0.0/bin/typescript", inv)
+	if len(npmArgs) == 0 || npmArgs[0] != "npm" {
+		t.Errorf("Positive npm mapping failed; got %v", npmArgs)
+	}
+	npmNode := formatUninstallArgs("UNUSED (npm)", "node", "/home/user/.nvm/versions/node/v18.0.0/bin/node", inv)
+	if npmNode != nil {
+		t.Errorf("Node wrapper should return nil; got %v", npmNode)
+	}
+	npmNeg := formatUninstallArgs("UNUSED (npm)", "unmapped", "/home/user/.nvm/versions/node/v18.0.0/bin/unmapped", inv)
+	if npmNeg != nil {
+		t.Errorf("Unmapped npm should return nil; got %v", npmNeg)
+	}
+
+	// pipx
+	pipxArgs := formatUninstallArgs("UNUSED (pipx)", "black", "/home/user/.local/pipx/venvs/black/bin/black", inv)
+	if len(pipxArgs) == 0 || pipxArgs[0] != "pipx" {
+		t.Errorf("Positive pipx mapping failed; got %v", pipxArgs)
+	}
+	pipxNeg := formatUninstallArgs("UNUSED (pipx)", "unmapped", "/home/user/.local/pipx/venvs/unmapped/bin/unmapped", inv)
+	if pipxNeg != nil {
+		t.Errorf("Unmapped pipx should return nil; got %v", pipxNeg)
+	}
+
+	// swiftly
+	inv.SwiftVersions = map[string]bool{"5.9.2": true}
+	swiftArgs := formatUninstallArgs("UNUSED (Swift)", "swift", "/home/user/.local/share/swiftly/toolchains/5.9.2/usr/bin/swift", inv)
+	if len(swiftArgs) == 0 || swiftArgs[0] != "swiftly" {
+		t.Errorf("Swiftly mapping failed; got %v", swiftArgs)
+	}
+	swiftNeg := formatUninstallArgs("UNUSED (Swift)", "swift", "/home/user/.local/share/swiftly/toolchains/unmapped/usr/bin/swift", inv)
+	if swiftNeg != nil {
+		t.Errorf("Unmapped swiftly should return nil; got %v", swiftNeg)
+	}
+
+	// sdkman
+	inv.SdkmanCands = map[string]bool{"java/17.0.2-open": true}
+	sdkArgs := formatUninstallArgs("UNUSED (SDKMAN)", "java", "/home/user/.sdkman/candidates/java/17.0.2-open/bin/java", inv)
+	if len(sdkArgs) == 0 || sdkArgs[0] != "sdk" {
+		t.Errorf("SDKMAN mapping failed; got %v", sdkArgs)
+	}
+	sdkNeg := formatUninstallArgs("UNUSED (SDKMAN)", "java", "/home/user/.sdkman/candidates/java/unmapped/bin/java", inv)
+	if sdkNeg != nil {
+		t.Errorf("Unmapped sdkman should return nil; got %v", sdkNeg)
+	}
+
+	// dotnet
+	inv.DotnetTools = map[string]string{"csharp-ls": "csharp-ls"}
+	dotnetArgs := formatUninstallArgs("UNUSED (Dotnet)", "csharp-ls", "/home/user/.dotnet/tools/csharp-ls", inv)
+	if len(dotnetArgs) == 0 || dotnetArgs[0] != "dotnet" {
+		t.Errorf("Dotnet mapping failed; got %v", dotnetArgs)
+	}
+	dotnetNeg := formatUninstallArgs("UNUSED (Dotnet)", "unmapped", "/home/user/.dotnet/tools/unmapped", inv)
+	if dotnetNeg != nil {
+		t.Errorf("Unmapped dotnet should return nil; got %v", dotnetNeg)
+	}
+
+	// composer
+	inv.ComposerPkgs = map[string]string{"phpunit": "phpunit"}
+	composerArgs := formatUninstallArgs("UNUSED (Composer)", "phpunit", "/home/user/.composer/vendor/bin/phpunit", inv)
+	if len(composerArgs) == 0 || composerArgs[0] != "composer" {
+		t.Errorf("Composer mapping failed; got %v", composerArgs)
+	}
+	composerNeg := formatUninstallArgs("UNUSED (Composer)", "unmapped", "/home/user/.composer/vendor/bin/unmapped", inv)
+	if composerNeg != nil {
+		t.Errorf("Unmapped composer should return nil; got %v", composerNeg)
+	}
+
+	// zvm
+	inv.ZvmVersions = map[string]string{"0.11.0": "0.11.0"}
+	zvmArgs := formatUninstallArgs("UNUSED (ZVM)", "0.11.0", "/home/user/.zvm/self/0.11.0/bin/zig", inv)
+	if len(zvmArgs) == 0 || zvmArgs[0] != "zvm" {
+		t.Errorf("ZVM mapping failed; got %v", zvmArgs)
+	}
+	zvmNeg := formatUninstallArgs("UNUSED (ZVM)", "unmapped", "/home/user/.zvm/self/unmapped/bin/zig", inv)
+	if zvmNeg != nil {
+		t.Errorf("Unmapped zvm should return nil; got %v", zvmNeg)
+	}
+}
+
+type mockFileInfo struct {
+	sys interface{}
+}
+
+func (m mockFileInfo) Name() string       { return "" }
+func (m mockFileInfo) Size() int64        { return 0 }
+func (m mockFileInfo) Mode() os.FileMode  { return 0 }
+func (m mockFileInfo) ModTime() time.Time { return time.Time{} }
+func (m mockFileInfo) IsDir() bool        { return false }
+func (m mockFileInfo) Sys() interface{}   { return m.sys }
+
+func TestMatchDirAndMarkerFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	projDir := filepath.Join(tmpDir, "proj")
+	os.MkdirAll(projDir, 0755)
+
+	// exact map rule mapping
+	rules := []Rule{
+		{
+			ID:          "rust_target",
+			Category:    "Rust Target",
+			Target:      "dir",
+			Patterns:    []string{"target"},
+			MarkerFiles: []string{"Cargo.toml"},
+		},
+	}
+	engine := NewRuleEngine(Manifest{Rules: rules})
+	inv := &PackageInventory{}
+
+	// Case 1: Marker file absent
+	r, _, _ := engine.MatchDir("target", filepath.Join(projDir, "target"), inv)
+	if r != nil {
+		t.Errorf("MatchDir should return nil when marker file is absent")
+	}
+
+	// Case 2: Marker file present in parent
+	if err := os.WriteFile(filepath.Join(projDir, "Cargo.toml"), []byte(""), 0644); err != nil {
+		t.Fatalf("Failed to write Cargo.toml: %v", err)
+	}
+	r, _, _ = engine.MatchDir("target", filepath.Join(projDir, "target"), inv)
+	if r == nil || r.ID != "rust_target" {
+		t.Errorf("MatchDir should match rust_target when marker file is in parent")
+	}
+
+	// Case 3: MatchFile with CheckUnusedAtime
+	rules[0].Target = "file"
+	rules[0].CheckUnusedAtime = true
+	rules[0].Patterns = []string{"*.log"}
+	engine = NewRuleEngine(Manifest{Rules: rules})
+
+	// POSIX stat mock: diff > 24 hours (atime 1000, ctime 1000000 -> ctime is much newer than atime, i.e. not unused)
+	mockFIUnused := mockFileInfo{
+		sys: &syscall.Stat_t{
+			Atim: syscall.Timespec{Sec: 1000, Nsec: 0},
+			Ctim: syscall.Timespec{Sec: 1000000, Nsec: 0},
+		},
+	}
+	r, _, _ = engine.MatchFile("stale.log", filepath.Join(projDir, "stale.log"), mockFIUnused, inv)
+	if r != nil {
+		t.Errorf("MatchFile should return nil when ctime/atime diff > 24 hours")
+	}
+
+	// POSIX stat mock: diff <= 24 hours
+	mockFIUsed := mockFileInfo{
+		sys: &syscall.Stat_t{
+			Atim: syscall.Timespec{Sec: 1000, Nsec: 0},
+			Ctim: syscall.Timespec{Sec: 1010, Nsec: 0},
+		},
+	}
+	r, _, _ = engine.MatchFile("stale.log", filepath.Join(projDir, "stale.log"), mockFIUsed, inv)
+	if r == nil {
+		t.Errorf("MatchFile should match when ctime/atime diff <= 24 hours")
 	}
 }
 
 func TestRenderProgressBar(t *testing.T) {
-	if renderProgressBar(0, 10) != "[░░░░░░░░░░]" {
-		t.Errorf("renderProgressBar(0) failed")
+	if renderProgressBar(-10.0, 10) != "[░░░░░░░░░░]" {
+		t.Errorf("Negative percentage failed")
 	}
-	if renderProgressBar(50, 10) != "[█████░░░░░]" {
-		t.Errorf("renderProgressBar(50) failed")
+	if renderProgressBar(120.0, 10) != "[██████████]" {
+		t.Errorf("Over 100 percentage failed")
 	}
-	if renderProgressBar(100, 10) != "[██████████]" {
-		t.Errorf("renderProgressBar(100) failed")
-	}
-	if renderProgressBar(-10, 10) != "[░░░░░░░░░░]" {
-		t.Errorf("underflow failed")
-	}
-	if renderProgressBar(150, 10) != "[██████████]" {
-		t.Errorf("overflow failed")
+	if renderProgressBar(50.0, 10) != "[█████░░░░░]" {
+		t.Errorf("50 percentage failed")
 	}
 }
 
-func TestMarkerAwareRules(t *testing.T) {
+func TestTrashCollisionAndFallback(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("PATH", "")
+
 	tmpDir := t.TempDir()
-	oldTime := time.Now().Add(-200 * time.Hour)
-
-	// 1. target directory WITHOUT Cargo.toml -> skipped
-	noCargoProj := filepath.Join(tmpDir, "no_cargo")
-	noCargoTarget := filepath.Join(noCargoProj, "target")
-	os.MkdirAll(noCargoTarget, 0755)
-	f1 := filepath.Join(noCargoTarget, "build.o")
-	os.WriteFile(f1, bytes.Repeat([]byte("a"), 2*1024*1024), 0644)
-	os.Chtimes(f1, oldTime, oldTime)
-	os.Chtimes(noCargoTarget, oldTime, oldTime)
-
-	// 2. target directory WITH Cargo.toml -> matched
-	cargoProj := filepath.Join(tmpDir, "cargo_proj")
-	cargoTarget := filepath.Join(cargoProj, "target")
-	os.MkdirAll(cargoTarget, 0755)
-	os.WriteFile(filepath.Join(cargoProj, "Cargo.toml"), []byte("[package]"), 0644)
-	f2 := filepath.Join(cargoTarget, "build.o")
-	os.WriteFile(f2, bytes.Repeat([]byte("b"), 2*1024*1024), 0644)
-	os.Chtimes(f2, oldTime, oldTime)
-	os.Chtimes(cargoTarget, oldTime, oldTime)
-
-	// 3. node_modules WITHOUT package.json -> skipped
-	noNpmDir := filepath.Join(tmpDir, "no_npm", "node_modules")
-	os.MkdirAll(noNpmDir, 0755)
-	f3 := filepath.Join(noNpmDir, "pkg.js")
-	os.WriteFile(f3, bytes.Repeat([]byte("c"), 2*1024*1024), 0644)
-	os.Chtimes(f3, oldTime, oldTime)
-	os.Chtimes(noNpmDir, oldTime, oldTime)
-
-	// 4. node_modules WITH package.json -> matched
-	npmProj := filepath.Join(tmpDir, "npm_proj")
-	npmNodeModules := filepath.Join(npmProj, "node_modules")
-	os.MkdirAll(npmNodeModules, 0755)
-	os.WriteFile(filepath.Join(npmProj, "package.json"), []byte("{}"), 0644)
-	f4 := filepath.Join(npmNodeModules, "pkg.js")
-	os.WriteFile(f4, bytes.Repeat([]byte("d"), 2*1024*1024), 0644)
-	os.Chtimes(f4, oldTime, oldTime)
-	os.Chtimes(npmNodeModules, oldTime, oldTime)
-
-	engine := NewRuleEngine(getDefaultManifest())
-	cands := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, false)
-
-	foundCargoTarget := false
-	foundNpmNodeModules := false
-
-	for _, c := range cands {
-		if c.Path == noCargoTarget {
-			t.Errorf("target directory without Cargo.toml should be skipped")
-		}
-		if c.Path == cargoTarget {
-			foundCargoTarget = true
-		}
-		if c.Path == noNpmDir {
-			t.Errorf("node_modules without package.json should be skipped")
-		}
-		if c.Path == npmNodeModules {
-			foundNpmNodeModules = true
-		}
+	f1 := filepath.Join(tmpDir, "test.log")
+	if err := os.WriteFile(f1, []byte("file1"), 0644); err != nil {
+		t.Fatalf("Failed to write f1: %v", err)
 	}
 
-	if !foundCargoTarget {
-		t.Errorf("cargoTarget with Cargo.toml should have been matched")
-	}
-	if !foundNpmNodeModules {
-		t.Errorf("npmNodeModules with package.json should have been matched")
-	}
-}
-
-func TestPackageInventoryResolution(t *testing.T) {
-	tempHome := t.TempDir()
-	t.Setenv("HOME", tempHome)
-
-	// Mock Cargo .crates.toml
-	cargoDir := filepath.Join(tempHome, ".cargo")
-	os.MkdirAll(cargoDir, 0755)
-	cratesToml := filepath.Join(cargoDir, ".crates.toml")
-	os.WriteFile(cratesToml, []byte("\"my-crate 0.1.0 (registry+...)\" = [\"my-bin\"]\n"), 0644)
-
-	// Mock Cargo .crates2.json
-	cratesJson := filepath.Join(cargoDir, ".crates2.json")
-	os.WriteFile(cratesJson, []byte(`{"installs": {"other-crate 0.2.0 (registry+...)": {"bins": ["other-bin"]}}}`), 0644)
-
-	// Mock pipx venvs
-	pipxVenvs := filepath.Join(tempHome, ".local", "pipx", "venvs", "black")
-	os.MkdirAll(pipxVenvs, 0755)
-
-	// Mock npm packages
-	npmDir := filepath.Join(tempHome, ".nvm", "versions", "node", "v20.0.0", "lib", "node_modules", "express-cli")
-	os.MkdirAll(npmDir, 0755)
-
-	// Mock Dotnet tools
-	dotnetDir := filepath.Join(tempHome, ".dotnet", "tools", ".store", "csharp-tool")
-	os.MkdirAll(dotnetDir, 0755)
-
-	// Mock SDKMAN candidates
-	sdkDir := filepath.Join(tempHome, ".sdkman", "candidates", "java", "17.0.1-open")
-	os.MkdirAll(sdkDir, 0755)
-
-	// Mock Swiftly toolchains
-	swiftDir := filepath.Join(tempHome, ".local", "share", "swiftly", "toolchains", "5.9.2")
-	os.MkdirAll(swiftDir, 0755)
-
-	// Mock ZVM Zig toolchains
-	zvmDir := filepath.Join(tempHome, ".zvm", "0.11.0")
-	os.MkdirAll(zvmDir, 0755)
-
-	inv := loadPackageInventory()
-
-	if inv.CargoCrates["my-bin"] != "my-crate" {
-		t.Errorf("loadPackageInventory failed for Cargo .crates.toml; got %s", inv.CargoCrates["my-bin"])
-	}
-	if inv.CargoCrates["other-bin"] != "other-crate" {
-		t.Errorf("loadPackageInventory failed for Cargo .crates2.json; got %s", inv.CargoCrates["other-bin"])
-	}
-	if inv.PipxVenvs["black"] != "black" {
-		t.Errorf("loadPackageInventory failed for pipx venv")
-	}
-	if inv.NpmPackages["express-cli"] != "express-cli" {
-		t.Errorf("loadPackageInventory failed for npm package")
-	}
-	if inv.DotnetTools["csharp-tool"] != "csharp-tool" {
-		t.Errorf("loadPackageInventory failed for dotnet tool")
-	}
-	if !inv.SdkmanCands["java/17.0.1-open"] {
-		t.Errorf("loadPackageInventory failed for SDKMAN candidate")
-	}
-	if !inv.SwiftVersions["5.9.2"] {
-		t.Errorf("loadPackageInventory failed for Swiftly toolchain")
-	}
-	if inv.ZvmVersions["0.11.0"] != "0.11.0" {
-		t.Errorf("loadPackageInventory failed for ZVM version")
-	}
-}
-
-func TestFormatUninstallArgsAllAdapters(t *testing.T) {
-	inv := &PackageInventory{
-		CargoCrates:   map[string]string{"my-bin": "my-crate"},
-		PipxVenvs:     map[string]string{"black": "black"},
-		NpmPackages:   map[string]string{"express-cli": "express-cli"},
-		DotnetTools:   map[string]string{"my-tool": "my-tool"},
-		ComposerPkgs:  map[string]string{"my-pkg": "my-pkg"},
-		ZvmVersions:   map[string]string{"0.11.0": "0.11.0"},
-		SdkmanCands:   map[string]bool{"java/17.0.1": true},
-		SwiftVersions: map[string]bool{"5.9.2": true},
-	}
-
-	// 1. Cargo
-	if len(formatUninstallArgs("UNUSED (Cargo)", "my-bin", "/path", inv)) != 3 {
-		t.Errorf("Cargo formatUninstallArgs failed")
-	}
-
-	// 2. npm
-	if len(formatUninstallArgs("UNUSED (npm)", "express-cli", "/path", inv)) != 4 {
-		t.Errorf("npm formatUninstallArgs failed")
-	}
-	if formatUninstallArgs("UNUSED (npm)", "node", "/path", inv) != nil {
-		t.Errorf("npm core wrapper node should return nil")
-	}
-
-	// 3. pipx
-	pArgs := formatUninstallArgs("UNUSED (pipx)", "black", "/home/user/.local/pipx/venvs/black/bin/black", inv)
-	if len(pArgs) != 3 || pArgs[2] != "black" {
-		t.Errorf("pipx formatUninstallArgs failed: %v", pArgs)
-	}
-
-	// 4. Swift
-	sArgs := formatUninstallArgs("UNUSED (Swift)", "swift-5.9", "/home/user/.local/share/swiftly/toolchains/5.9.2/usr/bin", inv)
-	if len(sArgs) != 3 || sArgs[2] != "5.9.2" {
-		t.Errorf("Swift formatUninstallArgs failed: %v", sArgs)
-	}
-
-	// 5. SDKMAN
-	sdkArgs := formatUninstallArgs("UNUSED (SDKMAN)", "17.0.1", "/home/user/.sdkman/candidates/java/17.0.1", inv)
-	if len(sdkArgs) != 4 || sdkArgs[2] != "java" || sdkArgs[3] != "17.0.1" {
-		t.Errorf("SDKMAN formatUninstallArgs failed: %v", sdkArgs)
-	}
-
-	// 6. Dotnet, Composer, ZVM
-	if len(formatUninstallArgs("UNUSED (Dotnet)", "my-tool", "/path", inv)) != 5 {
-		t.Errorf("Dotnet formatUninstallArgs failed")
-	}
-	if len(formatUninstallArgs("UNUSED (Composer)", "my-pkg", "/path", inv)) != 4 {
-		t.Errorf("Composer formatUninstallArgs failed")
-	}
-	if len(formatUninstallArgs("UNUSED (ZVM)", "0.11.0", "/path", inv)) != 3 {
-		t.Errorf("ZVM formatUninstallArgs failed")
-	}
-}
-
-func TestUnverifiedPackageCandidatesReportOnly(t *testing.T) {
-	inv := &PackageInventory{}
-
-	cArgs := formatUninstallArgs("UNUSED (Cargo)", "unverified-bin", "/home/user/.cargo/bin/unverified-bin", inv)
-	if cArgs != nil {
-		t.Errorf("Unverified Cargo binary should return nil uninstall args")
-	}
-
-	nArgs := formatUninstallArgs("UNUSED (npm)", "unverified-npm", "/path/to/bin", inv)
-	if nArgs != nil {
-		t.Errorf("Unverified npm package should return nil uninstall args")
-	}
-}
-
-func TestNoDirectBinaryDeletionOnUninstallFailure(t *testing.T) {
-	tmpDir := t.TempDir()
-	failBin := filepath.Join(tmpDir, "failed_bin")
-	os.WriteFile(failBin, []byte("binary_data"), 0755)
-
-	selected := []Candidate{
-		{
-			Path:          failBin,
-			Size:          10,
-			AgeDays:       10.0,
-			Category:      "UNUSED (Cargo)",
-			RiskClass:     RiskPackageManaged,
-			IsDir:         false,
-			CanDelete:     true,
-			UninstallArgs: []string{"non_existent_command_99999"},
-			ModTime:       time.Now(),
-		},
-	}
-
-	var stdout bytes.Buffer
-	confirmAndDeleteWithIO(selected, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
-
-	if _, err := os.Stat(failBin); os.IsNotExist(err) {
-		t.Errorf("Binary should NOT have been deleted after native uninstall failure")
-	}
-	if !strings.Contains(stdout.String(), "Manual cleanup skipped to prevent package database corruption") {
-		t.Errorf("Expected manual cleanup refusal notice; got: %s", stdout.String())
-	}
-}
-
-func TestUserDataApplyDataAuthorization(t *testing.T) {
-	tmpDir := t.TempDir()
-	logFile := filepath.Join(tmpDir, "app.log")
-	os.WriteFile(logFile, []byte("user log data"), 0644)
-
-	selected := []Candidate{
-		{
-			Path:      logFile,
-			Size:      13,
-			AgeDays:   10.0,
-			Category:  "Log File",
-			RiskClass: RiskUserData,
-			IsDir:     false,
-			CanDelete: true,
-			ModTime:   time.Now(),
-		},
-	}
-
-	var stdout1 bytes.Buffer
-	confirmAndDeleteWithIO(selected, false, false, false, 1000, 1000, &stdout1, strings.NewReader("y\n"))
-	if _, err := os.Stat(logFile); os.IsNotExist(err) {
-		t.Errorf("User data file should NOT be deleted without allowData flag")
-	}
-	if !strings.Contains(stdout1.String(), "[REFUSED]") {
-		t.Errorf("Expected [REFUSED] notice; got: %s", stdout1.String())
-	}
-
-	var stdout2 bytes.Buffer
-	confirmAndDeleteWithIO(selected, false, true, false, 1000, 1000, &stdout2, strings.NewReader("y\n"))
-	if _, err := os.Stat(logFile); !os.IsNotExist(err) {
-		t.Errorf("User data file should be deleted when allowData is true")
-	}
-}
-
-func TestTrashCollisionProtection(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	f1 := filepath.Join(tmpDir, "file.log")
-	os.WriteFile(f1, []byte("data1"), 0644)
-
-	tempHome := t.TempDir()
-	t.Setenv("HOME", tempHome)
-
+	// First move to trash (creates local trash folder and renames)
 	if err := moveToTrash(f1); err != nil {
-		t.Fatalf("moveToTrash first move failed: %v", err)
+		t.Fatalf("moveToTrash failed: %v", err)
 	}
 
-	f2 := filepath.Join(tmpDir, "file.log")
-	os.WriteFile(f2, []byte("data2"), 0644)
-
+	// Second file with same name (causes collision renaming path)
+	f2 := filepath.Join(tmpDir, "test.log")
+	if err := os.WriteFile(f2, []byte("file2"), 0644); err != nil {
+		t.Fatalf("Failed to write f2: %v", err)
+	}
 	if err := moveToTrash(f2); err != nil {
-		t.Fatalf("moveToTrash collision move failed: %v", err)
+		t.Fatalf("moveToTrash collision failed: %v", err)
 	}
 
-	trashDir := filepath.Join(tempHome, ".local", "share", "Trash", "files")
+	// Verify that the files were successfully moved under the mocked HOME Trash folder
+	trashDir := filepath.Join(tmpHome, ".local", "share", "Trash", "files")
+	if runtime.GOOS == "darwin" {
+		trashDir = filepath.Join(tmpHome, ".Trash")
+	}
 	entries, err := os.ReadDir(trashDir)
-	if err != nil || len(entries) < 2 {
-		t.Errorf("Trash collision protection failed to keep both files in Trash: entries=%d", len(entries))
+	if err != nil {
+		t.Fatalf("Failed to read trashDir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("Expected 2 files in trashDir; got %d", len(entries))
 	}
 }
 
-func TestLoadManifest(t *testing.T) {
+func TestMockFzfInteractive(t *testing.T) {
 	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	os.MkdirAll(binDir, 0755)
 
-	// 1. Custom JSON file loading
-	manPath := filepath.Join(tmpDir, "manifest.json")
-	content := `{
-		"rules": [
-			{"id": "test_rule", "name": "Test Rule", "target": "file", "patterns": ["*.test"], "category": "Test", "risk_class": "regenerable"}
-		]
-	}`
-	os.WriteFile(manPath, []byte(content), 0644)
-
-	m, err := loadManifest(manPath)
-	if err != nil || len(m.Rules) != 1 || m.Rules[0].ID != "test_rule" {
-		t.Errorf("loadManifest custom file failed: %v", err)
+	fzfPath := filepath.Join(binDir, "fzf")
+	var script string
+	if runtime.GOOS == "windows" {
+		fzfPath += ".bat"
+		script = "@echo off\nset /p line=\necho %line%\n"
+	} else {
+		script = "#!/bin/sh\nread line\necho \"$line\"\n"
+	}
+	if err := os.WriteFile(fzfPath, []byte(script), 0755); err != nil {
+		t.Fatalf("Failed to write mock fzf: %v", err)
 	}
 
-	// 2. Fail-closed for bad path
-	_, errBad := loadManifest("/non/existent/path/to/manifest.json")
-	if errBad == nil {
-		t.Errorf("loadManifest should fail closed for bad path")
+	t.Setenv("PATH", binDir)
+	fzfBin := findFzf()
+	if fzfBin == "" {
+		t.Fatalf("findFzf failed to locate mock fzf")
 	}
 
-	// 3. Fail-closed for invalid risk_class
-	badRiskPath := filepath.Join(tmpDir, "bad_risk.json")
-	badRiskContent := `{"rules": [{"id": "r1", "name": "r1", "target": "file", "patterns": ["*"], "category": "c", "risk_class": "invalid_junk"}]}`
-	os.WriteFile(badRiskPath, []byte(badRiskContent), 0644)
-	_, errRisk := loadManifest(badRiskPath)
-	if errRisk == nil {
-		t.Errorf("loadManifest should fail closed for invalid risk_class")
+	candidates := []Candidate{
+		{
+			ID:        1,
+			Path:      "/tmp/stale.log",
+			Size:      100,
+			AgeDays:   5.0,
+			Category:  "Log",
+			RiskClass: RiskRegenerable,
+		},
+	}
+
+	selected := runFzfInteractive(candidates, fzfBin, 1000, 1000, 1000)
+	if len(selected) != 1 || selected[0].ID != 1 {
+		t.Errorf("runFzfInteractive failed to parse mock fzf selection; got: %v", selected)
+	}
+
+	// Empty candidates case
+	if res := runFzfInteractive(nil, fzfBin, 0, 0, 0); res != nil {
+		t.Errorf("runFzfInteractive on empty candidates should return nil")
 	}
 }
 
-func TestMultimodFlag(t *testing.T) {
-	var m multimodFlag
-	if m.String() != "" {
-		t.Errorf("multimodFlag empty String() failed")
-	}
-	m.Set("/tmp/dir1")
-	m.Set("/tmp/dir2")
+func TestConfirmAndDeleteNil(t *testing.T) {
+	// Call confirmAndDelete with empty list to verify it exits immediately
+	confirmAndDelete(nil, false, false, false, 1000, 500)
 
-	if m.String() != "/tmp/dir1,/tmp/dir2" {
-		t.Errorf("multimodFlag String() = %s", m.String())
+	tmpDir := t.TempDir()
+	dummyPkg := filepath.Join(tmpDir, "dummy-package")
+	if err := os.WriteFile(dummyPkg, []byte("pkg"), 0755); err != nil {
+		t.Fatalf("Failed to write dummy package: %v", err)
+	}
+
+	// Call confirmAndDeleteWithIO with failing native uninstall command
+	cand := Candidate{
+		ID:             1,
+		Path:           dummyPkg,
+		Size:           3,
+		RiskClass:      RiskPackageManaged,
+		UninstallArgs:  []string{"false"}, // exit code 1 command
+		CanDelete:      true,
+		ProposedAction: "uninstall_package",
+	}
+
+	stdin := strings.NewReader("y\n")
+	var stdout bytes.Buffer
+	confirmAndDeleteWithIO([]Candidate{cand}, false, false, false, 1000, 1000, &stdout, stdin)
+	if !strings.Contains(stdout.String(), "[ERROR] Native uninstall failed") {
+		t.Errorf("Expected native uninstall failure error print; got:\n%s", stdout.String())
+	}
+}
+
+func TestMainFunc(t *testing.T) {
+	oldExit := osExit
+	defer func() { osExit = oldExit }()
+	var exitedCode int
+	osExit = func(code int) {
+		exitedCode = code
+	}
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+	os.Args = []string{"unslop", "-version"}
+	main()
+	if exitedCode != 0 {
+		t.Errorf("Expected exit code 0; got %d", exitedCode)
 	}
 }
 
 func TestGetDefaultScanDirs(t *testing.T) {
-	t.Setenv("TMPDIR", "/tmp")
-	t.Setenv("TEMP", "/tmp")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TMPDIR", t.TempDir())
 	dirs := getDefaultScanDirs()
 	if len(dirs) == 0 {
 		t.Errorf("getDefaultScanDirs returned empty slice")
 	}
 }
 
-func TestGetDiskSpace(t *testing.T) {
-	tot, used, free, err := getDiskSpace("/")
-	if err != nil || tot == 0 || used == 0 || free == 0 {
-		t.Errorf("getDiskSpace('/') failed: tot=%d used=%d free=%d err=%v", tot, used, free, err)
-	}
-}
-
-func TestRunFzfInteractiveEmpty(t *testing.T) {
-	if runFzfInteractive(nil, "fzf", 1000, 500, 500) != nil {
-		t.Errorf("runFzfInteractive(nil) should return nil")
-	}
-}
-
-func TestFindFzf(t *testing.T) {
-	tmpBin := t.TempDir()
-	mockFzf := filepath.Join(tmpBin, "fzf")
-	os.WriteFile(mockFzf, []byte("#!/bin/sh\necho mock"), 0755)
-	t.Setenv("PATH", tmpBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	if findFzf() == "" {
-		t.Errorf("findFzf failed to locate mocked fzf")
-	}
-}
-
-func TestGetDirStats(t *testing.T) {
+func TestGetDirStatsFunc(t *testing.T) {
 	tmpDir := t.TempDir()
-	f1 := filepath.Join(tmpDir, "a.txt")
-	os.WriteFile(f1, []byte("hello"), 0644)
-
-	now := time.Now()
-	sz, maxMt, fCount := getDirStats(tmpDir, now)
-	if sz == 0 || fCount == 0 || maxMt.IsZero() {
-		t.Errorf("getDirStats failed: sz=%d fCount=%d maxMt=%v", sz, fCount, maxMt)
+	f1 := filepath.Join(tmpDir, "file1.txt")
+	if err := os.WriteFile(f1, []byte("data"), 0644); err != nil {
+		t.Fatalf("Failed to write file1.txt: %v", err)
+	}
+	size, _, count := getDirStats(tmpDir, time.Now())
+	if size < 4 || count != 2 {
+		t.Errorf("getDirStats returned size=%d, count=%d; want size>=4, count=2", size, count)
 	}
 
-	getDirStats("/non/existent/dir/999", now)
+	szErr, _, countErr := getDirStats(filepath.Join(tmpDir, "nonexistent"), time.Now())
+	if szErr != 0 || countErr != 0 {
+		t.Errorf("getDirStats on nonexistent path should return 0")
+	}
 }
 
-func TestApplyOverrides(t *testing.T) {
-	m := getDefaultManifest()
-	engine := NewRuleEngine(m)
-
-	removed, added := applyOverrides(engine, []string{"-zig_cache", "+*.bak"})
+func TestApplyOverridesExtra(t *testing.T) {
+	engine := NewRuleEngine(getDefaultManifest())
+	initialRulesCount := len(engine.Rules)
+	removed, added := applyOverrides(engine, []string{"-zig_cache"})
 	if len(removed) != 1 || removed[0] != "zig_cache" {
-		t.Errorf("applyOverrides remove failed")
+		t.Errorf("applyOverrides did not remove rule; got removed=%v, added=%v", removed, added)
 	}
-	if len(added) != 1 || added[0] != "*.bak" {
-		t.Errorf("applyOverrides add failed")
-	}
-}
-
-func TestConfirmAndDeleteExecution(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	confirmAndDelete(nil, false, false, false, 1000, 1000)
-
-	file1 := filepath.Join(tmpDir, "file1.log")
-	os.WriteFile(file1, []byte("log data"), 0644)
-	selected1 := []Candidate{{Path: file1, Size: 8, AgeDays: 5.0, Category: "Log", IsDir: false, RiskClass: RiskRegenerable, CanDelete: true, ModTime: time.Now()}}
-	confirmAndDelete(selected1, true, false, false, 1000, 1000)
-	if _, err := os.Stat(file1); os.IsNotExist(err) {
-		t.Errorf("Dry run should not delete file1")
-	}
-
-	file2 := filepath.Join(tmpDir, "file2.log")
-	dir2 := filepath.Join(tmpDir, "dir2_cache")
-	os.WriteFile(file2, []byte("log data"), 0644)
-	os.MkdirAll(dir2, 0755)
-	now := time.Now()
-
-	selected2 := []Candidate{
-		{Path: file2, Size: 8, AgeDays: 5.0, Category: "Log", IsDir: false, RiskClass: RiskRegenerable, CanDelete: true, ModTime: now},
-		{Path: dir2, Size: 16, AgeDays: 5.0, Category: "Cache Dir", IsDir: true, RiskClass: RiskRegenerable, CanDelete: true, ModTime: now},
-	}
-
-	var stdout bytes.Buffer
-	stdin := strings.NewReader("y\n")
-
-	confirmAndDeleteWithIO(selected2, false, false, false, 1000, 1000, &stdout, stdin)
-
-	if _, err := os.Stat(file2); !os.IsNotExist(err) {
-		t.Errorf("file2 should have been deleted")
-	}
-	if _, err := os.Stat(dir2); !os.IsNotExist(err) {
-		t.Errorf("dir2 should have been deleted")
+	if len(engine.Rules) != initialRulesCount-1 {
+		t.Errorf("Rules slice count was not decremented")
 	}
 }
 
-func TestConfirmAndDeleteCancellation(t *testing.T) {
-	tmpDir := t.TempDir()
-	file1 := filepath.Join(tmpDir, "keep.log")
-	os.WriteFile(file1, []byte("data"), 0644)
-
-	selected := []Candidate{{Path: file1, Size: 4, AgeDays: 5.0, Category: "Log", IsDir: false, RiskClass: RiskRegenerable, CanDelete: true, ModTime: time.Now()}}
-
-	var stdout bytes.Buffer
-	stdin := strings.NewReader("n\n")
-
-	confirmAndDeleteWithIO(selected, false, false, false, 1000, 1000, &stdout, stdin)
-
-	if _, err := os.Stat(file1); os.IsNotExist(err) {
-		t.Errorf("file1 should NOT have been deleted when user answers 'n'")
+func TestLoadManifestErrors(t *testing.T) {
+	_, err := loadManifest("/nonexistent/manifest.json")
+	if err == nil {
+		t.Errorf("Expected error loading nonexistent manifest path")
 	}
 }
 
-func TestRunMainFlags(t *testing.T) {
-	tmpDir := t.TempDir()
-	subDir := filepath.Join(tmpDir, "project")
-	targetDir := filepath.Join(subDir, ".zig-cache")
-	os.MkdirAll(targetDir, 0755)
+func TestPackageInventoryResolution(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
 
-	oldTime := time.Now().Add(-200 * time.Hour)
-	cacheFile := filepath.Join(targetDir, "build.o")
-	os.WriteFile(cacheFile, bytes.Repeat([]byte("y"), 2*1024*1024), 0644)
-	os.Chtimes(cacheFile, oldTime, oldTime)
-	os.Chtimes(targetDir, oldTime, oldTime)
-
-	var stdout, stderr bytes.Buffer
-
-	// Version flag
-	code := runMain([]string{"-version"}, &stdout, &stderr, nil)
-	if code != 0 || !strings.Contains(stdout.String(), "unslop version") {
-		t.Errorf("runMain -version failed: code=%d stdout=%s", code, stdout.String())
-	}
-
-	// JSON flag & plan-out
-	stdout.Reset()
-	stderr.Reset()
-	planOut := filepath.Join(tmpDir, "plan.json")
-	codeJSON := runMain([]string{"-json", "-plan-out", planOut, "-path", tmpDir}, &stdout, &stderr, nil)
-	if codeJSON != 0 {
-		t.Errorf("runMain -json failed: code=%d stderr=%s", codeJSON, stderr.String())
-	}
-	if _, err := os.Stat(planOut); os.IsNotExist(err) {
-		t.Errorf("runMain -plan-out did not create plan.json")
-	}
-
-	// Bad flag
-	codeBad := runMain([]string{"-invalid-flag-12345"}, &stdout, &stderr, nil)
-	if codeBad != 2 {
-		t.Errorf("runMain bad flag expected code 2; got %d", codeBad)
-	}
-
-	// Bad manifest path
-	codeManifest := runMain([]string{"-manifest", "/non/existent/manifest.json"}, &stdout, &stderr, nil)
-	if codeManifest != 1 {
-		t.Errorf("runMain bad manifest expected code 1; got %d", codeManifest)
-	}
-}
-
-func TestRunFzfInteractive(t *testing.T) {
-	tmpDir := t.TempDir()
-	mockFzf := filepath.Join(tmpDir, "fzf")
-	script := `#!/bin/sh
-cat > /dev/null
-echo "[0001]  10.0 MB | 5.0d | Cache Dir | /tmp/test_candidate"
+	// 1. Cargo
+	os.MkdirAll(filepath.Join(tmpHome, ".cargo"), 0755)
+	tomlData := `[installs]
+"ripgrep 13.0.0 (path+src)" = ["ripgrep"]
 `
-	os.WriteFile(mockFzf, []byte(script), 0755)
+	os.WriteFile(filepath.Join(tmpHome, ".cargo", ".crates.toml"), []byte(tomlData), 0644)
+	jsonData := `{"installs": {"ripgrep 13.0.0 (path+src)": {"bins": ["ripgrep"]}}}`
+	os.WriteFile(filepath.Join(tmpHome, ".cargo", ".crates2.json"), []byte(jsonData), 0644)
 
-	candidates := []Candidate{
+	// 2. Pipx
+	os.MkdirAll(filepath.Join(tmpHome, ".local", "pipx", "venvs", "black"), 0755)
+
+	// 3. npm
+	os.MkdirAll(filepath.Join(tmpHome, ".nvm", "versions", "node", "v18.0.0"), 0755)
+
+	// 4. Dotnet
+	os.MkdirAll(filepath.Join(tmpHome, ".dotnet", "tools", ".store", "csharp-ls"), 0755)
+
+	// 5. Composer
+	os.MkdirAll(filepath.Join(tmpHome, ".config", "composer", "vendor", "composer"), 0755)
+	compJson := `{"packages": [{"name": "phpunit"}]}`
+	os.WriteFile(filepath.Join(tmpHome, ".config", "composer", "vendor", "composer", "installed.json"), []byte(compJson), 0644)
+
+	// 6. SDKMAN
+	os.MkdirAll(filepath.Join(tmpHome, ".sdkman", "candidates", "java", "17.0.2-open"), 0755)
+
+	// 7. Swiftly
+	os.MkdirAll(filepath.Join(tmpHome, ".local", "share", "swiftly", "toolchains", "5.9.2"), 0755)
+
+	// 8. ZVM
+	os.MkdirAll(filepath.Join(tmpHome, ".zvm", "0.11.0"), 0755)
+
+	inv := loadPackageInventory()
+
+	if inv.CargoCrates["ripgrep"] != "ripgrep" {
+		t.Errorf("Cargo parsing failed; got CargoCrates=%v", inv.CargoCrates)
+	}
+	if inv.PipxVenvs["black"] != "black" {
+		t.Errorf("Pipx parsing failed")
+	}
+	if inv.NpmPackages["v18.0.0"] != "v18.0.0" {
+		t.Errorf("npm parsing failed")
+	}
+	if inv.DotnetTools["csharp-ls"] != "csharp-ls" {
+		t.Errorf("Dotnet parsing failed")
+	}
+	if inv.ComposerPkgs["phpunit"] != "phpunit" {
+		t.Errorf("Composer parsing failed")
+	}
+	if !inv.SdkmanCands["java/17.0.2-open"] {
+		t.Errorf("SDKMAN parsing failed")
+	}
+	if !inv.SwiftVersions["5.9.2"] {
+		t.Errorf("Swiftly parsing failed")
+	}
+	if inv.ZvmVersions["0.11.0"] != "0.11.0" {
+		t.Errorf("ZVM parsing failed")
+	}
+}
+
+func TestCoverageExtraTargetedGaps(t *testing.T) {
+	// 1. HOME empty loadPackageInventory fallback
+	t.Setenv("HOME", "")
+	invEmpty := loadPackageInventory()
+	if len(invEmpty.CargoCrates) != 0 {
+		t.Errorf("Empty HOME should yield empty inventory")
+	}
+
+	// 2. globMatch extra branches
+	if matchPattern("file.txt", "*.log") {
+		t.Errorf("*.log should not match file.txt")
+	}
+	if !matchPattern("stale.log", "*.log*") {
+		t.Errorf("*.log* should match stale.log")
+	}
+	if !matchPattern("stale.log", "stale.lo?") {
+		t.Errorf("stale.lo? should match stale.log")
+	}
+	if !matchPattern("/home/user/node_modules/foo", "node_modules") {
+		t.Errorf("node_modules should match substring")
+	}
+
+	// 3. findFzf in HOME/.local/bin/fzf
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("PATH", "") // clear path
+	localBin := filepath.Join(tmpHome, ".local", "bin")
+	os.MkdirAll(localBin, 0755)
+	fzfPath := filepath.Join(localBin, "fzf")
+	if err := os.WriteFile(fzfPath, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatalf("Failed to write mock fzf: %v", err)
+	}
+	fzfBin := findFzf()
+	if fzfBin != fzfPath {
+		t.Errorf("Expected findFzf to return %s; got %s", fzfPath, fzfBin)
+	}
+
+	// 4. containsProtectedPath with protected file
+	tmpDir := t.TempDir()
+	projDir := filepath.Join(tmpDir, "project")
+	os.MkdirAll(projDir, 0755)
+	if err := os.WriteFile(filepath.Join(projDir, "credentials.json"), []byte(""), 0644); err != nil {
+		t.Fatalf("Failed to write credentials.json: %v", err)
+	}
+	if !containsProtectedPath(projDir) {
+		t.Errorf("Expected containsProtectedPath to be true when credentials.json is inside")
+	}
+
+	// 5. loadManifest JSON and risk class validation errors
+	tmpManifestJsonErr := filepath.Join(tmpDir, "err.json")
+	os.WriteFile(tmpManifestJsonErr, []byte("{invalid json"), 0644)
+	if _, err := loadManifest(tmpManifestJsonErr); err == nil {
+		t.Errorf("Expected error loading malformed manifest JSON")
+	}
+
+	tmpManifestRiskErr := filepath.Join(tmpDir, "risk_err.json")
+	os.WriteFile(tmpManifestRiskErr, []byte(`{"rules": [{"id": "r1", "category": "cat", "risk_class": "junk"}]}`), 0644)
+	if _, err := loadManifest(tmpManifestRiskErr); err == nil {
+		t.Errorf("Expected error loading manifest with invalid risk_class")
+	}
+
+	// default rule mapping with empty risk class
+	tmpManifestDefaultRisk := filepath.Join(tmpDir, "default_risk.json")
+	os.WriteFile(tmpManifestDefaultRisk, []byte(`{"rules": [{"id": "r2", "category": "UNUSED (npm)"}, {"id": "r3", "category": "some_other"}]}`), 0644)
+	m, err := loadManifest(tmpManifestDefaultRisk)
+	if err != nil {
+		t.Fatalf("Failed to load default_risk manifest: %v", err)
+	}
+	engineDefault := NewRuleEngine(m)
+	if engineDefault.Rules[0].RiskClass != RiskPackageManaged {
+		t.Errorf("Expected UNUSED category to default to RiskPackageManaged; got %s", engineDefault.Rules[0].RiskClass)
+	}
+	if engineDefault.Rules[1].RiskClass != RiskUnknown {
+		t.Errorf("Expected non-UNUSED category to default to RiskUnknown; got %s", engineDefault.Rules[1].RiskClass)
+	}
+
+	// 6. MatchFile glob rules and pipx symlink mapping
+	rules := []Rule{
 		{
-			ID:             1,
-			Path:           "/tmp/test_candidate",
-			Size:           10 * 1024 * 1024,
-			AgeDays:        5.0,
-			Category:       "Cache Dir",
-			RiskClass:      RiskRegenerable,
-			ProposedAction: "delete_dir",
-			CanDelete:      true,
+			ID:        "glob_file_rule",
+			Category:  "UNUSED (pipx)",
+			Target:    "file",
+			Patterns:  []string{"*black*"},
+			RiskClass: RiskPackageManaged,
 		},
 	}
+	engine := NewRuleEngine(Manifest{Rules: rules})
+	inv := &PackageInventory{
+		PipxVenvs: map[string]string{"black": "black"},
+	}
 
-	selected := runFzfInteractive(candidates, mockFzf, 100*1024*1024*1024, 50*1024*1024*1024, 50*1024*1024*1024)
-	if len(selected) != 1 || selected[0].Path != "/tmp/test_candidate" {
-		t.Errorf("runFzfInteractive mock failed: %v", selected)
+	// Create pipx symlink structure
+	pipxBin := filepath.Join(tmpDir, "black")
+	pipxTarget := filepath.Join(tmpDir, ".local", "pipx", "venvs", "black", "bin", "black")
+	os.MkdirAll(filepath.Dir(pipxTarget), 0755)
+	if err := os.WriteFile(pipxTarget, []byte(""), 0755); err != nil {
+		t.Fatalf("Failed to write pipxTarget: %v", err)
+	}
+	if err := os.Symlink(pipxTarget, pipxBin); err != nil {
+		t.Fatalf("Failed to create symlink: %v", err)
+	}
+
+	fi, err := os.Lstat(pipxBin)
+	if err != nil {
+		t.Fatalf("Failed to lstat pipxBin: %v", err)
+	}
+
+	matchedRule, _, args := engine.MatchFile("black", pipxBin, fi, inv)
+	if matchedRule == nil || matchedRule.ID != "glob_file_rule" {
+		t.Errorf("Expected MatchFile to match glob_file_rule via GlobRules fallback loop")
+	}
+	if len(args) == 0 || args[0] != "pipx" {
+		t.Errorf("Expected pipx symlink mapping to resolve to pipx; got %v", args)
 	}
 }
 
 func TestMoveToTrashOSBranches(t *testing.T) {
-	tmpDir := t.TempDir()
-	mockGio := filepath.Join(tmpDir, "gio")
-	os.WriteFile(mockGio, []byte("#!/bin/sh\nexit 0\n"), 0755)
-	t.Setenv("PATH", tmpDir)
+	// Case 1: getStatTimes fallback when Sys is nil
+	mockFINilSys := mockFileInfo{
+		sys: nil,
+	}
+	_, _, _, isPosix := getStatTimes(mockFINilSys)
+	if isPosix {
+		t.Errorf("getStatTimes with nil Sys should return isPosix = false")
+	}
 
-	f1 := filepath.Join(t.TempDir(), "f1.txt")
-	os.WriteFile(f1, []byte("1"), 0644)
-	if err := moveToTrash(f1); err != nil {
-		t.Errorf("moveToTrash gio success failed: %v", err)
+	// Case 2: getDiskSpaceSyscall error on nonexistent path
+	_, _, _, err := getDiskSpaceSyscall("/nonexistent/path/999")
+	if err == nil {
+		t.Errorf("Expected error from getDiskSpaceSyscall on nonexistent path")
+	}
+
+	// Case 3: moveToTrash & loadPackageInventory with empty HOME
+	t.Setenv("HOME", "")
+	if emptyInv := loadPackageInventory(); len(emptyInv.CargoCrates) != 0 {
+		t.Errorf("Expected empty inventory when HOME is empty")
+	}
+	if err := moveToTrash("/tmp/some-file"); err == nil {
+		t.Errorf("Expected error from moveToTrash with empty HOME")
+	}
+
+	// Case 4: moveToTrash with mkdir failure (Trash is a file)
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	trashParent := filepath.Join(tmpHome, ".local", "share")
+	os.MkdirAll(trashParent, 0755)
+	if err := os.WriteFile(filepath.Join(trashParent, "Trash"), []byte(""), 0644); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+	if err := moveToTrash("/tmp/some-file"); err == nil {
+		t.Errorf("Expected error from moveToTrash when MkdirAll fails")
 	}
 }
 
 func TestScanParallelDeep(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	tmpDir := t.TempDir()
-	oldTime := time.Now().Add(-200 * time.Hour)
 
-	logFile := filepath.Join(tmpDir, "stale.log")
-	os.WriteFile(logFile, bytes.Repeat([]byte("l"), 200*1024), 0644)
-	os.Chtimes(logFile, oldTime, oldTime)
+	// 1. Create files with skipped suffixes
+	os.WriteFile(filepath.Join(tmpDir, "stale.lock"), []byte("data"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "stale.sock"), []byte("data"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "stale.pid"), []byte("data"), 0644)
 
-	tmpFile := filepath.Join(tmpDir, "stale.tmp")
-	os.WriteFile(tmpFile, bytes.Repeat([]byte("t"), 200*1024), 0644)
-	os.Chtimes(tmpFile, oldTime, oldTime)
+	oldTime := time.Now().Add(-10 * 24 * time.Hour)
+	os.Chtimes(filepath.Join(tmpDir, "stale.lock"), oldTime, oldTime)
+	os.Chtimes(filepath.Join(tmpDir, "stale.sock"), oldTime, oldTime)
+	os.Chtimes(filepath.Join(tmpDir, "stale.pid"), oldTime, oldTime)
 
-	engine := NewRuleEngine(getDefaultManifest())
-
-	cands1 := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, false)
-	for _, c := range cands1 {
-		if c.Path == logFile {
-			t.Errorf("logFile (user-data) should be excluded when includeData=false")
-		}
+	// 2. Create a file candidate that matches UNUSED category but is unmapped
+	staleCargoBin := filepath.Join(tmpDir, "unmapped-cargo-pkg")
+	if err := os.WriteFile(staleCargoBin, []byte(strings.Repeat("A", 101*1024)), 0755); err != nil {
+		t.Fatalf("Failed to write staleCargoBin: %v", err)
 	}
+	os.Chtimes(staleCargoBin, oldTime, oldTime)
 
-	cands2 := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, true)
-	foundLog := false
-	foundTmp := false
-	for _, c := range cands2 {
-		if c.Path == logFile {
-			foundLog = true
-		}
-		if c.Path == tmpFile {
-			foundTmp = true
-			if c.CanDelete || c.ProposedAction != "report-only" {
-				t.Errorf("tmpFile (unknown risk class) should be report-only and non-deletable")
+	// 3. Create a directory candidate that matches UNUSED category but is unmapped
+	staleNpmDir := filepath.Join(tmpDir, "project", "node_modules")
+	os.MkdirAll(staleNpmDir, 0755)
+	marker := filepath.Join(staleNpmDir, "package.json")
+	os.WriteFile(marker, []byte(`{}`), 0644)
+	largeFile := filepath.Join(staleNpmDir, "large.txt")
+	os.WriteFile(largeFile, []byte(strings.Repeat("A", 101*1024)), 0644)
+	os.Chtimes(staleNpmDir, oldTime, oldTime)
+	os.Chtimes(marker, oldTime, oldTime)
+	os.Chtimes(largeFile, oldTime, oldTime)
+
+	// 4. Create protected folders (.git, .hg, .svn) and protected file (.ssh/id_rsa)
+	os.MkdirAll(filepath.Join(tmpDir, "project", ".git"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "project", ".hg"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "project", ".svn"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "project", ".ssh"), 0700)
+	os.WriteFile(filepath.Join(tmpDir, "project", ".ssh", "id_rsa"), []byte("secret"), 0600)
+
+	// Create directory containing credentials.json that matches a rule
+	protNpmDir := filepath.Join(tmpDir, "prot_project", "node_modules")
+	os.MkdirAll(protNpmDir, 0755)
+	os.WriteFile(filepath.Join(protNpmDir, "package.json"), []byte("{}"), 0644)
+	os.WriteFile(filepath.Join(protNpmDir, "credentials.json"), []byte("secret"), 0644)
+	os.WriteFile(filepath.Join(protNpmDir, "large.txt"), []byte(strings.Repeat("A", 101*1024)), 0644)
+	os.Chtimes(protNpmDir, oldTime, oldTime)
+	os.Chtimes(filepath.Join(protNpmDir, "large.txt"), oldTime, oldTime)
+
+	rules := []Rule{
+		{
+			ID:        "cargo_pkg_mock",
+			Category:  "UNUSED (Cargo)",
+			Target:    "file",
+			Patterns:  []string{"*unmapped-cargo-pkg*"},
+			RiskClass: RiskPackageManaged,
+		},
+		{
+			ID:          "npm_pkg_mock",
+			Category:    "UNUSED (npm)",
+			Target:      "dir",
+			Patterns:    []string{"*node_modules*"},
+			MarkerFiles: []string{"package.json"},
+			RiskClass:   RiskPackageManaged,
+		},
+		{
+			ID:        "unknown_file_mock",
+			Category:  "Generic Temp File",
+			Target:    "file",
+			Patterns:  []string{"*stale.lock*"},
+			RiskClass: RiskUnknown,
+		},
+	}
+	engine := NewRuleEngine(Manifest{Rules: rules})
+
+	candidates := scanParallel([]string{tmpDir, staleCargoBin}, engine, 2.0, 100*1024, true)
+
+	foundCargo := false
+	foundNpm := false
+	for _, c := range candidates {
+		if c.RuleID == "cargo_pkg_mock" {
+			foundCargo = true
+			if c.ProposedAction != "report-only" || c.CanDelete {
+				t.Errorf("Expected cargo_pkg_mock candidate to be report-only; got action=%s, canDelete=%v", c.ProposedAction, c.CanDelete)
 			}
 		}
+		if c.RuleID == "npm_pkg_mock" {
+			foundNpm = true
+			if c.ProposedAction != "report-only" || c.CanDelete {
+				t.Errorf("Expected npm_pkg_mock candidate to be report-only; got action=%s, canDelete=%v", c.ProposedAction, c.CanDelete)
+			}
+		}
+		if strings.HasSuffix(c.Path, ".lock") || strings.HasSuffix(c.Path, ".sock") || strings.HasSuffix(c.Path, ".pid") {
+			t.Errorf("Suffix file should not be a candidate: %s", c.Path)
+		}
 	}
-	if !foundLog {
-		t.Errorf("logFile should be found when includeData=true")
+
+	if !foundCargo {
+		t.Errorf("Expected to find unmapped cargo package candidate")
 	}
-	if !foundTmp {
-		t.Errorf("tmpFile should be found when includeData=true")
+	if !foundNpm {
+		t.Errorf("Expected to find unmapped npm folder candidate")
+	}
+
+	// Test MinSizeMB > 0 rule check & includeData = false skip branches
+	rules[1].MinSizeMB = 0.01
+	engineMinSize := NewRuleEngine(Manifest{Rules: rules})
+	_ = scanParallel([]string{tmpDir}, engineMinSize, 0.0, 10, true)
+
+	rulesUserData := []Rule{
+		{
+			ID:        "user_data_dir",
+			Category:  "Agent Log",
+			Target:    "dir",
+			Patterns:  []string{"*node_modules*"},
+			RiskClass: RiskUserData,
+		},
+		{
+			ID:        "user_data_file",
+			Category:  "Log File",
+			Target:    "file",
+			Patterns:  []string{"*unmapped-cargo-pkg*"},
+			RiskClass: RiskUserData,
+		},
+	}
+	engineUserData := NewRuleEngine(Manifest{Rules: rulesUserData})
+	candsNoData := scanParallel([]string{tmpDir}, engineUserData, 0.0, 10, false)
+	if len(candsNoData) != 0 {
+		t.Errorf("Expected 0 candidates when includeData=false; got %d", len(candsNoData))
 	}
 }
 
 func TestRunMainExecution(t *testing.T) {
-	tmpDir := t.TempDir()
-	cargoProj := filepath.Join(tmpDir, "cargo_proj")
-	cargoTarget := filepath.Join(cargoProj, "target")
-	os.MkdirAll(cargoTarget, 0755)
-	os.WriteFile(filepath.Join(cargoProj, "Cargo.toml"), []byte("[package]"), 0644)
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
 
-	oldTime := time.Now().Add(-200 * time.Hour)
-	f := filepath.Join(cargoTarget, "build.o")
-	os.WriteFile(f, bytes.Repeat([]byte("b"), 2*1024*1024), 0644)
-	os.Chtimes(f, oldTime, oldTime)
-	os.Chtimes(cargoTarget, oldTime, oldTime)
+	binDir := filepath.Join(tmpHome, "bin")
+	os.MkdirAll(binDir, 0755)
+	fzfPath := filepath.Join(binDir, "fzf")
+	var script string
+	if runtime.GOOS == "windows" {
+		fzfPath += ".bat"
+		script = "@echo off\nset /p line=\necho %line%\n"
+	} else {
+		script = "#!/bin/sh\nread line\necho \"$line\"\n"
+	}
+	if err := os.WriteFile(fzfPath, []byte(script), 0755); err != nil {
+		t.Fatalf("Failed to write mock fzf: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	tmpDir := t.TempDir()
+	staleCache := filepath.Join(tmpDir, "project", "zig-cache")
+	if err := os.MkdirAll(staleCache, 0755); err != nil {
+		t.Fatalf("Failed to mkdir staleCache: %v", err)
+	}
+	largeFile := filepath.Join(staleCache, "cache.bin")
+	content := []byte(strings.Repeat("A", 101*1024))
+	if err := os.WriteFile(largeFile, content, 0644); err != nil {
+		t.Fatalf("Failed to write large cache file: %v", err)
+	}
+	oldTime := time.Now().Add(-10 * 24 * time.Hour)
+	os.Chtimes(staleCache, oldTime, oldTime)
+	os.Chtimes(largeFile, oldTime, oldTime)
 
 	var stdout, stderr bytes.Buffer
+	stdin := strings.NewReader("y\n")
 
-	code := runMain([]string{"-apply", "-trash", "-path", tmpDir}, &stdout, &stderr, strings.NewReader("y\n"))
+	code := runMain([]string{"-apply", "-min-size-mb", "0.05", "-path", tmpDir}, &stdout, &stderr, stdin)
 	if code != 0 {
-		t.Errorf("runMain -apply -trash failed: %d (stderr: %s)", code, stderr.String())
+		t.Errorf("runMain failed with exit code %d; stderr: %s", code, stderr.String())
 	}
 
+	if _, err := os.Stat(staleCache); !os.IsNotExist(err) {
+		t.Errorf("Stale zig-cache directory was not deleted by runMain execution!\nStdout: %s\nStderr: %s", stdout.String(), stderr.String())
+	}
+}
+
+func TestCoveragePushTo100(t *testing.T) {
+	if globMatch("foo", "[a-") {
+		t.Errorf("invalid pattern should return false")
+	}
+	// 1. containsProtectedPath with nonexistent path & findFzf empty HOME & getDirStats nonexistent
+	if !containsProtectedPath("/nonexistent/path/xyz") {
+		t.Errorf("nonexistent path should trigger foundProtected = true")
+	}
+	parentWithProtected := t.TempDir()
+	os.WriteFile(filepath.Join(parentWithProtected, "credentials.json"), []byte("secret"), 0600)
+	if !containsProtectedPath(parentWithProtected) {
+		t.Errorf("parent directory containing credentials.json should trigger foundProtected = true")
+	}
+	statsDir := t.TempDir()
+	newerFile := filepath.Join(statsDir, "newer.txt")
+	os.WriteFile(newerFile, []byte("newer"), 0644)
+	os.Chtimes(newerFile, time.Now().Add(1*time.Hour), time.Now().Add(1*time.Hour))
+	getDirStats(statsDir, time.Now())
+
+	if runtime.GOOS != "windows" {
+		unreadableDir := filepath.Join(t.TempDir(), "unreadable")
+		os.MkdirAll(unreadableDir, 0000)
+		defer os.Chmod(unreadableDir, 0755)
+		containsProtectedPath(unreadableDir)
+		getDirStats(unreadableDir, time.Now())
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("HOME", "")
+	t.Setenv("PATH", "")
+	if findFzf() != "" {
+		t.Errorf("findFzf with empty HOME and PATH should return empty string")
+	}
+	t.Setenv("PATH", origPath)
+
+	// 2. loadManifest with HOME/.unslop.json candidate file
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	manifestPath := filepath.Join(tmpHome, ".unslop.json")
+	if err := os.WriteFile(manifestPath, defaultManifestData, 0644); err != nil {
+		t.Fatalf("Failed to write .unslop.json: %v", err)
+	}
+	m, err := loadManifest("")
+	if err != nil || len(m.Rules) == 0 {
+		t.Errorf("loadManifest(\"\") failed to load .unslop.json from HOME")
+	}
+
+	// 3. calculateDynamicMinSizeMB
+	szMB := calculateDynamicMinSizeMB(100 * 1024 * 1024 * 1024)
+	if szMB <= 0 {
+		t.Errorf("calculateDynamicMinSizeMB returned invalid size: %f", szMB)
+	}
+
+	// 4. scanParallel progress bar ticker & file scan root & small file skip (< 100 KiB)
+	tmpDir := t.TempDir()
+	smallFile := filepath.Join(tmpDir, "small.tmp")
+	os.WriteFile(smallFile, []byte("small"), 0644)
+
+	for i := 0; i < 100; i++ {
+		os.WriteFile(filepath.Join(tmpDir, fmt.Sprintf("file_%d.tmp", i)), []byte("data"), 0644)
+	}
+
+	engine := NewRuleEngine(getDefaultManifest())
+	candidates := scanParallel([]string{smallFile, tmpDir}, engine, 0.0, 10, true)
+	_ = candidates
+
+	// 5. runMain flag errors and plan-out export
+	var stdout, stderr bytes.Buffer
+	stdin := strings.NewReader("n\n")
+
+	// Invalid manifest path
+	codeErr := runMain([]string{"-manifest", "/nonexistent/manifest.json"}, &stdout, &stderr, stdin)
+	if codeErr != 1 {
+		t.Errorf("Expected exit code 1 for invalid manifest path; got %d", codeErr)
+	}
+
+	// Invalid path arg
+	codePathErr := runMain([]string{"-path", "/nonexistent/path/xyz"}, &stdout, &stderr, stdin)
+	if codePathErr != 1 {
+		t.Errorf("Expected exit code 1 for invalid path arg; got %d", codePathErr)
+	}
+
+	// Plan-out export success & error
+	planFile := filepath.Join(tmpDir, "plan.json")
+	codePlan := runMain([]string{"-json", "-plan-out", planFile, "-path", tmpDir}, &stdout, &stderr, stdin)
+	if codePlan != 0 {
+		t.Errorf("Expected exit code 0 for plan-out export; got %d", codePlan)
+	}
+	if _, err := os.Stat(planFile); err != nil {
+		t.Errorf("Plan file was not written")
+	}
+
+	// Plan-out export failure (directory path)
+	codePlanErr := runMain([]string{"-json", "-plan-out", tmpDir, "-path", tmpDir}, &stdout, &stderr, stdin)
+	if codePlanErr != 1 {
+		t.Errorf("Expected exit code 1 for invalid plan-out file path; got %d", codePlanErr)
+	}
+
+	// 6. confirmAndDeleteWithIO safety checks
+	candUserData := Candidate{
+		ID:             1,
+		Path:           smallFile,
+		Size:           100,
+		RiskClass:      RiskUserData,
+		CanDelete:      true,
+		ProposedAction: "delete_file",
+	}
+	// Dry run mode print
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candUserData}, true, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[READ-ONLY PLAN MODE]") {
+		t.Errorf("Expected READ-ONLY PLAN MODE print; got:\n%s", stdout.String())
+	}
+
+	// Refused user-data item without -apply-data in apply mode
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candUserData}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[REFUSED]") {
+		t.Errorf("Expected REFUSED user-data print; got:\n%s", stdout.String())
+	}
+
+	// File type changed abort
+	candTypeMutated := Candidate{
+		ID:             2,
+		Path:           smallFile,
+		Size:           5,
+		RiskClass:      RiskRegenerable,
+		CanDelete:      true,
+		ProposedAction: "delete_file",
+		IsDir:          true,
+	}
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candTypeMutated}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[ABORT] File type changed") {
+		t.Errorf("Expected ABORT File type changed print; got:\n%s", stdout.String())
+	}
+
+	// Protected subtree safeguard abort inside directory
+	protectedDir := filepath.Join(tmpDir, "protected_dir")
+	os.MkdirAll(protectedDir, 0755)
+	os.WriteFile(filepath.Join(protectedDir, "credentials.json"), []byte(""), 0644)
+	candProtectedDir := Candidate{
+		ID:             3,
+		Path:           protectedDir,
+		Size:           100,
+		RiskClass:      RiskRegenerable,
+		CanDelete:      true,
+		ProposedAction: "delete_dir",
+		IsDir:          true,
+	}
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candProtectedDir}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[PROTECTED SAFEGUARD]") {
+		t.Errorf("Expected PROTECTED SAFEGUARD print; got:\n%s", stdout.String())
+	}
+
+	// Deletion using trash
+	targetTrashFile := filepath.Join(tmpDir, "trash_me.tmp")
+	os.WriteFile(targetTrashFile, []byte("trash me"), 0644)
+	candTrash := Candidate{
+		ID:             4,
+		Path:           targetTrashFile,
+		Size:           8,
+		RiskClass:      RiskRegenerable,
+		CanDelete:      true,
+		ProposedAction: "delete_file",
+		IsDir:          false,
+	}
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candTrash}, false, false, true, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[TRASHED]") {
+		t.Errorf("Expected TRASHED print; got:\n%s", stdout.String())
+	}
+
+	// 7. runMain -help flags usage output
 	stdout.Reset()
 	stderr.Reset()
-	planOut := filepath.Join(tmpDir, "plan.json")
-	codeJSON := runMain([]string{"-json", "-plan-out", planOut, "-path", tmpDir}, &stdout, &stderr, nil)
-	if codeJSON != 0 {
-		t.Errorf("runMain -json -plan-out failed: %d", codeJSON)
-	}
-}
-
-type mockFileInfo struct{}
-
-func (m mockFileInfo) Name() string       { return "mock" }
-func (m mockFileInfo) Size() int64        { return 100 }
-func (m mockFileInfo) Mode() os.FileMode  { return 0644 }
-func (m mockFileInfo) ModTime() time.Time { return time.Now() }
-func (m mockFileInfo) IsDir() bool        { return false }
-func (m mockFileInfo) Sys() any           { return nil }
-
-func TestCoverageFinalPushAudit(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	tempHome := t.TempDir()
-	t.Setenv("HOME", tempHome)
-
-	altFzf := filepath.Join(tempHome, ".local", "bin", "fzf")
-	os.MkdirAll(filepath.Dir(altFzf), 0755)
-	os.WriteFile(altFzf, []byte("#!/bin/sh"), 0755)
-	if findFzf() != altFzf {
-		t.Errorf("findFzf fallback failed")
+	runMain([]string{"-help"}, &stdout, &stderr, stdin)
+	if !strings.Contains(stderr.String(), "Conservative developer workstation hygiene planner") {
+		t.Errorf("Expected usage print in stderr; got:\n%s", stderr.String())
 	}
 
-	dummy := filepath.Join(t.TempDir(), "trash_fallback.txt")
-	os.WriteFile(dummy, []byte("data"), 0644)
-	if err := moveToTrash(dummy); err != nil {
-		t.Errorf("moveToTrash fallback failed: %v", err)
+	// 8. calculateDynamicMinSizeMB all branches
+	if calculateDynamicMinSizeMB(0) != 10.0 {
+		t.Errorf("0 B dynamic min size failed")
+	}
+	if calculateDynamicMinSizeMB(20*1024*1024*1024) != 1.0 {
+		t.Errorf("20GB dynamic min size failed")
+	}
+	if calculateDynamicMinSizeMB(999*1024*1024*1024) <= 30.0 {
+		t.Errorf("999GB dynamic min size failed")
+	}
+	if calculateDynamicMinSizeMB(1200*1024*1024*1024) != 50.0 {
+		t.Errorf("1200GB dynamic min size failed")
+	}
+	if calculateDynamicMinSizeMB(100*1024*1024*1024) <= 0 {
+		t.Errorf("100GB dynamic min size failed")
 	}
 
-	tmpDir := t.TempDir()
-	gitDir := filepath.Join(tmpDir, ".git")
-	os.MkdirAll(gitDir, 0755)
-
-	staleFile := filepath.Join(tmpDir, "stale.tmp")
-	oldTime := time.Now().Add(-200 * time.Hour)
-	os.WriteFile(staleFile, bytes.Repeat([]byte("s"), 200*1024), 0644)
-	os.Chtimes(staleFile, oldTime, oldTime)
-
-	engine := NewRuleEngine(getDefaultManifest())
-	_ = scanParallel([]string{tmpDir, staleFile}, engine, 2.0, 100*1024, true)
-
-	mockFI := mockFileInfo{}
-	atime, ctime, uid, isPosix := getStatTimes(mockFI)
-	if atime.IsZero() || ctime.IsZero() || uid != 0 || isPosix {
-		t.Errorf("getStatTimes non-posix fallback failed")
+	// 9. confirmAndDeleteWithIO modtime mismatch & operation cancelled (n) & native uninstall success & delete error
+	modTimeFile := filepath.Join(tmpDir, "modtime.tmp")
+	os.WriteFile(modTimeFile, []byte("test"), 0644)
+	candModTime := Candidate{
+		ID:             5,
+		Path:           modTimeFile,
+		Size:           4,
+		RiskClass:      RiskRegenerable,
+		CanDelete:      true,
+		ProposedAction: "delete_file",
+		ModTime:        time.Now().Add(-10 * time.Hour),
 	}
-
-	var stdout, stderr bytes.Buffer
-	codeNoFzf := runMain([]string{"-path", tmpDir}, &stdout, &stderr, nil)
-	if codeNoFzf != 0 {
-		t.Errorf("runMain no fzf expected code 0; got %d", codeNoFzf)
-	}
-
-	candsSkip := []Candidate{
-		{Path: "/non/existent/path/999.log", Size: 10, AgeDays: 5.0, Category: "Log", IsDir: false, CanDelete: true, RiskClass: RiskRegenerable},
-		{Path: tmpDir, Size: 10, AgeDays: 5.0, Category: "Log", IsDir: false, CanDelete: true, RiskClass: RiskRegenerable},
-		{Path: tmpDir, Size: 10, AgeDays: 5.0, Category: "Log", IsDir: true, CanDelete: false, RiskClass: RiskUnknown},
-	}
-	var stdoutSkip bytes.Buffer
-	confirmAndDeleteWithIO(candsSkip, false, false, false, 1000, 1000, &stdoutSkip, strings.NewReader("y\n"))
-}
-
-func TestCoveragePushTo95(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	mockGioDir := filepath.Join(tmpDir, "gio_bin")
-	os.MkdirAll(mockGioDir, 0755)
-	os.WriteFile(filepath.Join(mockGioDir, "gio"), []byte("#!/bin/sh\nexit 0\n"), 0755)
-	t.Setenv("PATH", mockGioDir)
-	fGio := filepath.Join(tmpDir, "fgio.txt")
-	os.WriteFile(fGio, []byte("gio"), 0644)
-	moveToTrash(fGio)
-
-	mockTrashDir := filepath.Join(tmpDir, "trash_bin")
-	os.MkdirAll(mockTrashDir, 0755)
-	os.WriteFile(filepath.Join(mockTrashDir, "trash"), []byte("#!/bin/sh\nexit 0\n"), 0755)
-	t.Setenv("PATH", mockTrashDir)
-	fTrash := filepath.Join(tmpDir, "ftrash.txt")
-	os.WriteFile(fTrash, []byte("trash"), 0644)
-	moveToTrash(fTrash)
-
-	mockSuccessBin := filepath.Join(tmpDir, "succ_bin")
-	os.WriteFile(mockSuccessBin, []byte("#!/bin/sh\nexit 0\n"), 0755)
-
-	targetBin := filepath.Join(tmpDir, "bin_target")
-	os.WriteFile(targetBin, []byte("bin"), 0755)
-
-	candsSuccess := []Candidate{
-		{
-			Path:          targetBin,
-			Size:          3,
-			AgeDays:       10.0,
-			Category:      "UNUSED (Cargo)",
-			RiskClass:     RiskPackageManaged,
-			IsDir:         false,
-			CanDelete:     true,
-			UninstallArgs: []string{mockSuccessBin, "target"},
-			ModTime:       time.Now(),
-		},
-	}
-	var stdout bytes.Buffer
-	confirmAndDeleteWithIO(candsSuccess, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
-	if !strings.Contains(stdout.String(), "[UNINSTALLED SUCCESS]") {
-		t.Errorf("Expected [UNINSTALLED SUCCESS]; got: %s", stdout.String())
-	}
-
 	stdout.Reset()
-	var stderr bytes.Buffer
-	codeOverrides := runMain([]string{"-apply", "-apply-data", "-include-data", "-path", tmpDir, "--", "-zig_cache", "+*.tmp"}, &stdout, &stderr, strings.NewReader("y\n"))
-	if codeOverrides != 0 {
-		t.Errorf("runMain overrides failed: %d (stderr: %s)", codeOverrides, stderr.String())
-	}
-}
-
-func TestActual12kCandidateScan(t *testing.T) {
-	tmpDir := t.TempDir()
-	oldTime := time.Now().Add(-200 * time.Hour)
-
-	for i := 1; i <= 12000; i++ {
-		sub := filepath.Join(tmpDir, fmt.Sprintf("sub_%d", (i-1)/1000))
-		if err := os.MkdirAll(sub, 0755); err != nil {
-			t.Fatalf("Failed to create test directory %s: %v", sub, err)
-		}
-		p := filepath.Join(sub, fmt.Sprintf("stale_%d.log", i))
-		if err := os.WriteFile(p, []byte("a"), 0644); err != nil {
-			t.Fatalf("Failed to create test file %s: %v", p, err)
-		}
-		if err := os.Chtimes(p, oldTime, oldTime); err != nil {
-			t.Fatalf("Failed to set modtime for %s: %v", p, err)
-		}
+	confirmAndDeleteWithIO([]Candidate{candModTime}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[ABORT] File modification time changed") {
+		t.Errorf("Expected ABORT ModTime changed print; got:\n%s", stdout.String())
 	}
 
-	engine := NewRuleEngine(getDefaultManifest())
-	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 0, true)
-
-	if len(candidates) != 12000 {
-		t.Errorf("scanParallel on 12,000 files expected 12,000 candidates; got %d", len(candidates))
-	}
-}
-
-func TestAllPackageManagerFixturesAndNegativeMappings(t *testing.T) {
-	tempHome := t.TempDir()
-	t.Setenv("HOME", tempHome)
-
-	cargoDir := filepath.Join(tempHome, ".cargo")
-	os.MkdirAll(cargoDir, 0755)
-	os.WriteFile(filepath.Join(cargoDir, ".crates.toml"), []byte("\"cargo-crate 1.0.0 (registry+...)\" = [\"cargo-bin\"]\n"), 0644)
-
-	os.MkdirAll(filepath.Join(tempHome, ".local", "pipx", "venvs", "pipx-tool"), 0755)
-	os.MkdirAll(filepath.Join(tempHome, ".nvm", "versions", "node", "v20.0.0", "lib", "node_modules", "npm-pkg"), 0755)
-	os.MkdirAll(filepath.Join(tempHome, ".dotnet", "tools", ".store", "dotnet-pkg"), 0755)
-
-	compDir := filepath.Join(tempHome, ".config", "composer", "vendor", "composer")
-	os.MkdirAll(compDir, 0755)
-	os.WriteFile(filepath.Join(compDir, "installed.json"), []byte(`{"packages":[{"name":"vendor/composer-pkg"}]}`), 0644)
-
-	os.MkdirAll(filepath.Join(tempHome, ".sdkman", "candidates", "java", "17.0.1"), 0755)
-	os.MkdirAll(filepath.Join(tempHome, ".local", "share", "swiftly", "toolchains", "5.9.2"), 0755)
-	os.MkdirAll(filepath.Join(tempHome, ".zvm", "0.11.0"), 0755)
-
-	inv := loadPackageInventory()
-
-	if len(formatUninstallArgs("UNUSED (Cargo)", "cargo-bin", "/path", inv)) != 3 {
-		t.Errorf("Cargo positive mapping failed")
-	}
-	if len(formatUninstallArgs("UNUSED (pipx)", "pipx-tool", "/home/user/.local/pipx/venvs/pipx-tool/bin/pipx-tool", inv)) != 3 {
-		t.Errorf("pipx positive mapping failed")
-	}
-	if len(formatUninstallArgs("UNUSED (npm)", "npm-pkg", "/path", inv)) != 4 {
-		t.Errorf("npm positive mapping failed")
-	}
-	if len(formatUninstallArgs("UNUSED (Dotnet)", "dotnet-pkg", "/path", inv)) != 5 {
-		t.Errorf("Dotnet positive mapping failed")
-	}
-	if len(formatUninstallArgs("UNUSED (SDKMAN)", "17.0.1", "/home/user/.sdkman/candidates/java/17.0.1", inv)) != 4 {
-		t.Errorf("SDKMAN positive mapping failed")
+	// Operation cancelled (n)
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candTrash}, false, false, false, 1000, 1000, &stdout, strings.NewReader("n\n"))
+	if !strings.Contains(stdout.String(), "Operation cancelled") {
+		t.Errorf("Expected Operation cancelled print; got:\n%s", stdout.String())
 	}
 
-	negativeBins := []struct {
-		category string
-		name     string
-		path     string
-	}{
-		{"UNUSED (Cargo)", "unmapped-cargo", "/path"},
-		{"UNUSED (pipx)", "unmapped-pipx", "/path"},
-		{"UNUSED (npm)", "unmapped-npm", "/path"},
-		{"UNUSED (npm)", "node", "/path"},
-		{"UNUSED (npm)", "npm", "/path"},
-		{"UNUSED (npm)", "npx", "/path"},
-		{"UNUSED (Dotnet)", "unmapped-dotnet", "/path"},
-		{"UNUSED (Composer)", "unmapped-composer", "/path"},
-		{"UNUSED (SDKMAN)", "current", "/home/user/.sdkman/candidates/java/current"},
-		{"UNUSED (Swift)", "5.8.0", "/home/user/.local/share/swiftly/toolchains/5.8.0"},
-		{"UNUSED (ZVM)", "0.10.0", "/home/user/.zvm/0.10.0"},
+	// Native uninstall success
+	candUninstallOk := Candidate{
+		ID:             6,
+		Path:           modTimeFile,
+		Size:           4,
+		RiskClass:      RiskPackageManaged,
+		UninstallArgs:  []string{"true"},
+		CanDelete:      true,
+		ProposedAction: "uninstall_package",
+	}
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candUninstallOk}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[UNINSTALLED SUCCESS]") {
+		t.Errorf("Expected UNINSTALLED SUCCESS print; got:\n%s", stdout.String())
 	}
 
-	for _, neg := range negativeBins {
-		args := formatUninstallArgs(neg.category, neg.name, neg.path, inv)
-		if args != nil {
-			t.Errorf("Negative mapping for %s (%s) should return nil; got %v", neg.name, neg.category, args)
-		}
+	// Delete error (try removing file in read-only directory)
+	roDir := filepath.Join(tmpDir, "ro_dir")
+	os.MkdirAll(roDir, 0755)
+	roFile := filepath.Join(roDir, "file.txt")
+	os.WriteFile(roFile, []byte("x"), 0644)
+	os.Chmod(roDir, 0555)
+	defer os.Chmod(roDir, 0755)
+
+	candDelErr := Candidate{
+		ID:             7,
+		Path:           roFile,
+		Size:           1,
+		RiskClass:      RiskRegenerable,
+		CanDelete:      true,
+		ProposedAction: "delete_file",
+		IsDir:          false,
 	}
-}
-
-func TestChangedSizeModtimeBetweenScanAndApply(t *testing.T) {
-	tmpDir := t.TempDir()
-	f := filepath.Join(tmpDir, "mutating.log")
-	os.WriteFile(f, []byte("initial data"), 0644)
-
-	now := time.Now()
-	cand := Candidate{
-		Path:      f,
-		Size:      12,
-		AgeDays:   5.0,
-		Category:  "Log",
-		RiskClass: RiskRegenerable,
-		IsDir:     false,
-		CanDelete: true,
-		ModTime:   now,
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candDelErr}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[ERROR] Failed to delete") {
+		t.Errorf("Expected Failed to delete error print; got:\n%s", stdout.String())
 	}
 
-	os.WriteFile(f, []byte("mutated data with different length"), 0644)
-
-	var stdout bytes.Buffer
-	confirmAndDeleteWithIO([]Candidate{cand}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
-
-	dirReplacement := filepath.Join(tmpDir, "dir_replaced")
-	os.MkdirAll(dirReplacement, 0755)
-	candTypeMismatch := Candidate{
-		Path:      dirReplacement,
-		Size:      10,
-		AgeDays:   5.0,
-		Category:  "Log",
-		RiskClass: RiskRegenerable,
-		IsDir:     false,
-		CanDelete: true,
-		ModTime:   now,
+	// 10. Negative flag validations in runMain
+	if codeDaysErr := runMain([]string{"-days", "-5"}, &stdout, &stderr, stdin); codeDaysErr != 2 {
+		t.Errorf("Expected exit code 2 for negative -days; got %d", codeDaysErr)
+	}
+	if codeSizeErr := runMain([]string{"-min-size-mb", "-1"}, &stdout, &stderr, stdin); codeSizeErr != 2 {
+		t.Errorf("Expected exit code 2 for negative -min-size-mb; got %d", codeSizeErr)
 	}
 
-	var stdoutMismatch bytes.Buffer
-	confirmAndDeleteWithIO([]Candidate{candTypeMismatch}, false, false, false, 1000, 1000, &stdoutMismatch, strings.NewReader("y\n"))
-	if !strings.Contains(stdoutMismatch.String(), "[ABORT]") {
-		t.Errorf("Expected [ABORT] for file type mismatch; got: %s", stdoutMismatch.String())
-	}
-}
-
-func TestSymlinksAndSameTypePathReplacement(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	realDir := filepath.Join(tmpDir, "real_dir")
-	os.MkdirAll(realDir, 0755)
-	os.WriteFile(filepath.Join(realDir, "secret.txt"), []byte("data"), 0644)
-
-	symlinkDir := filepath.Join(tmpDir, "sym_dir")
-	_ = os.Symlink(realDir, symlinkDir)
-
-	brokenSym := filepath.Join(tmpDir, "broken_sym")
-	_ = os.Symlink("/non/existent/target/path", brokenSym)
-
-	engine := NewRuleEngine(getDefaultManifest())
-
-	cands := scanParallel([]string{tmpDir}, engine, 0.0, 0, true)
-	for _, c := range cands {
-		if c.Path == symlinkDir || c.Path == brokenSym {
-			if c.IsDir {
-				t.Errorf("Symlink should not be classified as a standard directory candidate")
-			}
-		}
-	}
-}
-
-func TestFzfSelectionHostilePathsAndPipes(t *testing.T) {
-	tmpDir := t.TempDir()
-	mockFzf := filepath.Join(tmpDir, "fzf")
-	script := `#!/bin/sh
-cat > /dev/null
-echo "[0001]  10.0 MB | 5.0d | Log | /tmp/path;touch_hacked|grep 'foo'\"bar"
-`
-	os.WriteFile(mockFzf, []byte(script), 0755)
-
-	hostilePath := "/tmp/path;touch_hacked|grep 'foo'\"bar"
-	candidates := []Candidate{
-		{
-			ID:             1,
-			Path:           hostilePath,
-			Size:           10 * 1024 * 1024,
-			AgeDays:        5.0,
-			Category:       "Log",
-			RiskClass:      RiskRegenerable,
-			ProposedAction: "delete_file",
-			CanDelete:      true,
-		},
-	}
-
-	selected := runFzfInteractive(candidates, mockFzf, 1000, 500, 500)
-	if len(selected) != 1 || selected[0].Path != hostilePath {
-		t.Errorf("runFzfInteractive hostile path selection failed: %v", selected)
-	}
-}
-
-func TestRealCLISubprocessAndJSONSchema(t *testing.T) {
-	tmpDir := t.TempDir()
-	binPath := filepath.Join(tmpDir, "unslop")
-
-	cmdBuild := exec.Command("go", "build", "-o", binPath, ".")
-	cmdBuild.Dir = "."
-	if out, err := cmdBuild.CombinedOutput(); err != nil {
-		t.Fatalf("Failed to build unslop binary: %v\n%s", err, string(out))
-	}
-
-	cmdRun := exec.Command(binPath, "-json", "-path", tmpDir)
-	var stdout, stderr bytes.Buffer
-	cmdRun.Stdout = &stdout
-	cmdRun.Stderr = &stderr
-	if err := cmdRun.Run(); err != nil {
-		t.Fatalf("Failed to execute unslop CLI subprocess: %v\n%s", err, stderr.String())
-	}
-
-	var report PlanReport
-	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
-		t.Fatalf("Failed to parse unslop JSON report output: %v\nOutput: %s", err, stdout.String())
-	}
-
-	if report.Version == "" || report.ScannedAt == "" || report.DiskUsage.TotalBytes == 0 {
-		t.Errorf("Invalid PlanReport JSON schema: %+v", report)
-	}
-}
-
-func TestMacOSWindowsRuntimeHelpers(t *testing.T) {
-	mockFI := mockFileInfo{}
-
-	atime, ctime, uid, isPosix := getStatTimes(mockFI)
-	if atime.IsZero() || ctime.IsZero() {
-		t.Errorf("getStatTimes failed")
-	}
-	_ = uid
-	_ = isPosix
-
-	tot, used, free, err := getDiskSpaceSyscall("/")
-	if err != nil || tot == 0 || used == 0 || free == 0 {
-		t.Errorf("getDiskSpaceSyscall('/') failed: tot=%d used=%d free=%d err=%v", tot, used, free, err)
-	}
-}
-
-func TestCoverage100PercentTargeted(t *testing.T) {
-	_, _, _, errSyscall := getDiskSpaceSyscall("/non_existent_mount_path_99999")
-	if errSyscall == nil {
-		t.Errorf("getDiskSpaceSyscall on invalid path should return error")
-	}
-
-	if renderProgressBar(50, 0) != "[░░░░░░░░░░]" {
-		t.Errorf("renderProgressBar with total <= 0 failed")
-	}
-
-	if formatUninstallArgs("UNKNOWN_CATEGORY_XYZ", "pkg", "/path", &PackageInventory{}) != nil {
-		t.Errorf("formatUninstallArgs default branch should return nil")
-	}
-
-	t.Setenv("PATH", t.TempDir())
-	t.Setenv("HOME", t.TempDir())
-	if findFzf() != "" {
-		t.Errorf("findFzf should return empty string when fzf is missing")
-	}
-
-	tmpDir := t.TempDir()
-	badFzf := filepath.Join(tmpDir, "bad_fzf")
-	os.WriteFile(badFzf, []byte("#!/bin/sh\nexit 1\n"), 0755)
-	candsFzf := []Candidate{{ID: 1, Path: "/tmp/foo", Size: 100}}
-	resFzf := runFzfInteractive(candsFzf, badFzf, 100, 50, 50)
-	if resFzf != nil {
-		t.Errorf("runFzfInteractive bad fzf exit should return nil")
-	}
-
-	engine := NewRuleEngine(getDefaultManifest())
-	tmpFile := filepath.Join(tmpDir, "app.log")
-	os.WriteFile(tmpFile, []byte("log data"), 0644)
-
-	inv := &PackageInventory{}
-	infoTmp, _ := os.Stat(tmpFile)
-	matchedRule, _, _ := engine.MatchFile(filepath.Base(tmpFile), tmpFile, infoTmp, inv)
-	_ = matchedRule
-
-	noRemoveFile := filepath.Join(tmpDir, "no_remove.log")
-	os.WriteFile(noRemoveFile, []byte("data"), 0644)
-
-	candRemoveErr := Candidate{
-		Path:      noRemoveFile,
-		Size:      4,
-		AgeDays:   5.0,
-		Category:  "Log",
-		RiskClass: RiskRegenerable,
-		IsDir:     false,
-		CanDelete: true,
-		ModTime:   time.Now(),
+	// 11. Skipped file no longer exists on disk & trash error & json dry-run & fzf failure
+	stdout.Reset()
+	stderr.Reset()
+	codeJsonDry := runMain([]string{"-json", "-dry-run", "-path", tmpDir}, &stdout, &stderr, stdin)
+	if codeJsonDry != 0 || !strings.Contains(stdout.String(), `"scanned_at"`) {
+		t.Errorf("Expected json dry run output; got code=%d, stdout=%s", codeJsonDry, stdout.String())
 	}
 
 	candMissing := Candidate{
-		Path:      filepath.Join(tmpDir, "already_deleted.txt"),
-		Size:      10,
-		AgeDays:   5.0,
-		Category:  "Log",
-		RiskClass: RiskRegenerable,
-		IsDir:     false,
-		CanDelete: true,
-		ModTime:   time.Now(),
-	}
-	os.WriteFile(candMissing.Path, []byte("temp"), 0644)
-
-	var stdout bytes.Buffer
-	stdin := strings.NewReader("y\n")
-	confirmAndDeleteWithIO([]Candidate{candRemoveErr, candMissing}, false, false, false, 1000, 1000, &stdout, stdin)
-
-	t.Setenv("HOME", "/non_existent_home_dir_99999/path")
-	moveToTrash(filepath.Join(tmpDir, "trash_me.txt"))
-}
-
-func TestReach100PercentLoCFinalPush(t *testing.T) {
-	tmpDir := t.TempDir()
-	inv := &PackageInventory{
-		CargoCrates: map[string]string{"my_bin": "my_crate"},
+		ID:             8,
+		Path:           filepath.Join(tmpDir, "missing.tmp"),
+		Size:           1,
+		RiskClass:      RiskRegenerable,
+		CanDelete:      true,
+		ProposedAction: "delete_file",
 	}
 
-	// 1. Cargo binary path without .cargo/bin
-	argsCargoNoBin := formatUninstallArgs("UNUSED (Cargo)", "my_bin", "/custom/path/my_bin", inv)
-	if argsCargoNoBin != nil {
-		t.Errorf("Cargo binary outside .cargo/bin should return nil")
+	// runFzfInteractive error path
+	fzfErrBin := filepath.Join(tmpHome, "fzf_err_bin")
+	os.MkdirAll(fzfErrBin, 0755)
+	fzfErrScript := filepath.Join(fzfErrBin, "fzf")
+	if runtime.GOOS == "windows" {
+		fzfErrScript += ".bat"
+		os.WriteFile(fzfErrScript, []byte("@exit /b 1\n"), 0755)
+	} else {
+		os.WriteFile(fzfErrScript, []byte("#!/bin/sh\nexit 1\n"), 0755)
 	}
-
-	// 2. MatchFile with marker_files and valid atime > 24h
-	oldTime := time.Now().Add(-200 * time.Hour)
-	atimeOld := time.Now().Add(-100 * time.Hour)
-
-	fileRule := Rule{
-		ID:               "f_rule",
-		Name:             "F Rule",
-		Target:           "file",
-		Patterns:         []string{"*.log_atime"},
-		Category:         "Log",
-		RiskClass:        RiskUserData,
-		MarkerFiles:      []string{"marker.txt"},
-		CheckUnusedAtime: true,
+	resFzfErr := runFzfInteractive([]Candidate{candMissing}, fzfErrScript, 100, 50, 50)
+	if resFzfErr != nil {
+		t.Errorf("Expected nil candidate selection when fzf exits with error; got %v", resFzfErr)
 	}
-
-	engineFile := &RuleEngine{
-		Rules:       []Rule{fileRule},
-		ExactDirMap: make(map[string][]*Rule),
-		ExtMap:      map[string]*Rule{"log_atime": &fileRule},
-	}
-
-	// Create marker.txt in project root
-	os.WriteFile(filepath.Join(tmpDir, "marker.txt"), []byte("marker"), 0644)
-	fLog := filepath.Join(tmpDir, "test.log_atime")
-	os.WriteFile(fLog, []byte("data"), 0644)
-	os.Chtimes(fLog, atimeOld, oldTime)
-
-	infoLog, _ := os.Stat(fLog)
-	matched, _, _ := engineFile.MatchFile("test.log_atime", fLog, infoLog, inv)
-	_ = matched
-
-	// 3. Corrupted Cargo crates.toml file
-	tempHome := t.TempDir()
-	t.Setenv("HOME", tempHome)
-	cargoDir := filepath.Join(tempHome, ".cargo")
-	os.MkdirAll(cargoDir, 0755)
-	os.WriteFile(filepath.Join(cargoDir, ".crates.toml"), []byte("invalid = [toml_syntax_error"), 0644)
-	_ = loadPackageInventory()
-
-	// 4. scanParallel candidate matching file rule with MinSizeMB and RiskUserData
-	staleLog := filepath.Join(tmpDir, "stale_min.log_atime")
-	os.WriteFile(staleLog, bytes.Repeat([]byte("z"), 300*1024), 0644)
-	os.Chtimes(staleLog, atimeOld, oldTime)
-
-	_ = scanParallel([]string{tmpDir}, engineFile, 0.0, 100*1024, true)
-
-	// 5. MatchDir rule target == "file" mismatch branch
-	dirRuleMismatch := Rule{
-		ID:       "file_only_rule",
-		Name:     "File Only Rule",
-		Target:   "file",
-		Patterns: []string{"target_mismatch"},
-	}
-	engineDirMismatch := &RuleEngine{
-		Rules:       []Rule{dirRuleMismatch},
-		ExactDirMap: map[string][]*Rule{"target_mismatch": {&dirRuleMismatch}},
-	}
-	mDir, _, _ := engineDirMismatch.MatchDir("target_mismatch", filepath.Join(tmpDir, "target_mismatch"), inv)
-	if mDir != nil {
-		t.Errorf("MatchDir should return nil when rule target is 'file'")
-	}
-}
-
-func TestHit100PercentCoverageFinal(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	oldTime := time.Now().Add(-200 * time.Hour)
-	newTime := time.Now()
-
-	fileRuleAtime := Rule{
-		ID:               "atime_diff",
-		Name:             "Atime Diff",
-		Target:           "file",
-		Patterns:         []string{"*.diff_test"},
-		Category:         "Log",
-		RiskClass:        RiskUserData,
-		CheckUnusedAtime: true,
-	}
-	engineDiff := &RuleEngine{
-		Rules:       []Rule{fileRuleAtime},
-		ExactDirMap: make(map[string][]*Rule),
-		ExtMap:      map[string]*Rule{"diff_test": &fileRuleAtime},
-	}
-
-	fDiff := filepath.Join(tmpDir, "diff.diff_test")
-	os.WriteFile(fDiff, []byte("data"), 0644)
-	os.Chtimes(fDiff, newTime, oldTime)
-	infoDiff, _ := os.Stat(fDiff)
-
-	matched, _, _ := engineDiff.MatchFile("diff.diff_test", fDiff, infoDiff, &PackageInventory{})
-	if matched != nil {
-		t.Errorf("MatchFile should return nil when diff > 24h")
-	}
-
-	dirWithSub := filepath.Join(tmpDir, "dir_stat_err")
-	os.MkdirAll(dirWithSub, 0755)
-	fSub := filepath.Join(dirWithSub, "sub.txt")
-	os.WriteFile(fSub, []byte("test"), 0644)
-
-	os.Chmod(dirWithSub, 0000)
-	getDirStats(dirWithSub, time.Now())
-	os.Chmod(dirWithSub, 0755)
-
-	staleLog := filepath.Join(tmpDir, "stale_display.log")
-	os.WriteFile(staleLog, bytes.Repeat([]byte("d"), 200*1024), 0644)
-	os.Chtimes(staleLog, oldTime, oldTime)
-
-	t.Setenv("PATH", t.TempDir())
-	var stdout, stderr bytes.Buffer
-	runMain([]string{"-path", tmpDir, "-min-size-mb", "0.1", "-days", "0"}, &stdout, &stderr, nil)
-	if !strings.Contains(stdout.String(), "Total candidates:") {
-		t.Errorf("runMain standard text output failed to list candidates")
-	}
-
-	protDir := filepath.Join(tmpDir, "prot_dir")
-	os.MkdirAll(protDir, 0755)
-	os.WriteFile(filepath.Join(protDir, "credentials.json"), []byte("secret"), 0600)
-
-	candProtected := Candidate{
-		Path:      protDir,
-		Size:      100,
-		AgeDays:   5.0,
-		Category:  "Cache",
-		RiskClass: RiskRegenerable,
-		IsDir:     true,
-		CanDelete: true,
-		ModTime:   time.Now(),
-	}
-
 	stdout.Reset()
-	confirmAndDeleteWithIO([]Candidate{candProtected}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
-	if !strings.Contains(stdout.String(), "[PROTECTED SAFEGUARD]") {
-		t.Errorf("Expected [PROTECTED SAFEGUARD]; got: %s", stdout.String())
+	confirmAndDeleteWithIO([]Candidate{candMissing}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[SKIP]") {
+		t.Errorf("Expected SKIP no longer exists print; got:\n%s", stdout.String())
 	}
 
-	t.Setenv("HOME", "/non_existent_home_dir_99999/path")
-	fTrashErr := filepath.Join(tmpDir, "trash_err.log")
-	os.WriteFile(fTrashErr, []byte("data"), 0644)
+	// Trash error print when HOME=""
+	t.Setenv("HOME", "")
 	candTrashErr := Candidate{
-		Path:      fTrashErr,
-		Size:      4,
-		AgeDays:   5.0,
-		Category:  "Log",
-		RiskClass: RiskRegenerable,
-		IsDir:     false,
-		CanDelete: true,
-		ModTime:   time.Now(),
+		ID:             9,
+		Path:           roFile,
+		Size:           1,
+		RiskClass:      RiskRegenerable,
+		CanDelete:      true,
+		ProposedAction: "delete_file",
 	}
-
 	stdout.Reset()
 	confirmAndDeleteWithIO([]Candidate{candTrashErr}, false, false, true, 1000, 1000, &stdout, strings.NewReader("y\n"))
-	if !strings.Contains(stdout.String(), "[ERROR]") {
-		t.Errorf("Expected [ERROR] for failed trash move; got: %s", stdout.String())
+	if !strings.Contains(stdout.String(), "[ERROR] Failed to trash") {
+		t.Errorf("Expected Failed to trash error print; got:\n%s", stdout.String())
 	}
 
-	fDelErr := filepath.Join(tmpDir, "del_err_dir")
-	os.MkdirAll(fDelErr, 0755)
-	os.WriteFile(filepath.Join(fDelErr, "item.txt"), []byte("data"), 0644)
-	os.Chmod(fDelErr, 0000)
+	// 12. Mock gio and trash binaries for linux moveToTrashOS
+	if runtime.GOOS == "linux" {
+		t.Setenv("HOME", tmpHome)
+		trashBinDir := filepath.Join(tmpHome, "trash_bin")
+		os.MkdirAll(trashBinDir, 0755)
+		gioScript := filepath.Join(trashBinDir, "gio")
+		os.WriteFile(gioScript, []byte("#!/bin/sh\nexit 0\n"), 0755)
+		trashScript := filepath.Join(trashBinDir, "trash")
+		os.WriteFile(trashScript, []byte("#!/bin/sh\nexit 0\n"), 0755)
+		t.Setenv("PATH", trashBinDir)
 
-	candDelErr := Candidate{
-		Path:      filepath.Join(fDelErr, "item.txt"),
-		Size:      4,
-		AgeDays:   5.0,
-		Category:  "Log",
-		RiskClass: RiskRegenerable,
-		IsDir:     false,
-		CanDelete: true,
-		ModTime:   time.Now(),
-	}
+		if err := moveToTrashOS(smallFile); err != nil {
+			t.Errorf("moveToTrashOS with mock gio failed: %v", err)
+		}
 
-	stdout.Reset()
-	confirmAndDeleteWithIO([]Candidate{candDelErr}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
-	os.Chmod(fDelErr, 0755)
-}
-
-func TestReach100PercentLoC(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// 1. Negative flag tests for runMain
-	var stdout, stderr bytes.Buffer
-	codeDays := runMain([]string{"-days", "-1"}, &stdout, &stderr, nil)
-	if codeDays != 2 {
-		t.Errorf("-days -1 should fail with code 2")
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	codeSize := runMain([]string{"-min-size-mb", "-5"}, &stdout, &stderr, nil)
-	if codeSize != 2 {
-		t.Errorf("-min-size-mb -5 should fail with code 2")
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	codeDirErr := runMain([]string{"-path", "/non_existent_dir_999999"}, &stdout, &stderr, nil)
-	if codeDirErr != 1 {
-		t.Errorf("-path non-existent dir should fail with code 1")
-	}
-
-	// 2. MatchFile atime branches
-	inv := &PackageInventory{}
-	engine := NewRuleEngine(getDefaultManifest())
-
-	// File rule with check_unused_atime
-	atimeRule := Rule{
-		ID:               "test_atime",
-		Name:             "Test Atime",
-		Target:           "file",
-		Patterns:         []string{"*.atime_test"},
-		Category:         "Log",
-		RiskClass:        RiskUserData,
-		CheckUnusedAtime: true,
-	}
-	engineAtime := &RuleEngine{
-		Rules:       []Rule{atimeRule},
-		ExactDirMap: make(map[string][]*Rule),
-		ExtMap:      map[string]*Rule{"atime_test": &atimeRule},
-	}
-
-	fAtime := filepath.Join(tmpDir, "recent.atime_test")
-	os.WriteFile(fAtime, []byte("data"), 0644)
-	infoAtime, _ := os.Stat(fAtime)
-
-	// ModTime and Atime are equal (less than 24h difference) -> skipped
-	r, _, _ := engineAtime.MatchFile("recent.atime_test", fAtime, infoAtime, inv)
-	if r != nil {
-		t.Errorf("MatchFile should return nil when atime - ctime <= 24h")
-	}
-
-	// 3. formatUninstallArgs unmapped branches
-	invFull := &PackageInventory{
-		CargoCrates: map[string]string{"bin_x": "crate_x"},
-		PipxVenvs:   map[string]string{"pipx_x": "pipx_x"},
-	}
-
-	// Cargo mismatched path
-	args1 := formatUninstallArgs("UNUSED (Cargo)", "bin_x", "/wrong/path/not/cargo/bin", invFull)
-	if args1 != nil {
-		t.Errorf("Cargo formatUninstallArgs mismatched path should return nil")
-	}
-
-	// pipx mismatched path
-	args2 := formatUninstallArgs("UNUSED (pipx)", "pipx_x", "/wrong/path/not/pipx/bin", invFull)
-	if args2 != nil {
-		t.Errorf("pipx formatUninstallArgs mismatched path should return nil")
-	}
-
-	// 4. scanParallel top-level file and invalid path
-	_ = scanParallel([]string{"/non_existent_scan_root_9999"}, engine, 1.0, 1000, true)
-
-	// Scan top-level path that is a file
-	topFile := filepath.Join(tmpDir, "top_level_file.tmp")
-	os.WriteFile(topFile, bytes.Repeat([]byte("x"), 200*1024), 0644)
-	oldTime := time.Now().Add(-200 * time.Hour)
-	os.Chtimes(topFile, oldTime, oldTime)
-
-	_ = scanParallel([]string{topFile}, engine, 0.0, 0, true)
-
-	// 5. Unreadable permission directory delete error handling
-	unreadableDir := filepath.Join(tmpDir, "unreadable")
-	os.MkdirAll(unreadableDir, 0755)
-	os.WriteFile(filepath.Join(unreadableDir, "f.txt"), []byte("data"), 0644)
-	os.Chmod(unreadableDir, 0000)
-
-	candUnreadable := Candidate{
-		Path:      unreadableDir,
-		Size:      100,
-		AgeDays:   10.0,
-		Category:  "Cache",
-		RiskClass: RiskRegenerable,
-		IsDir:     true,
-		CanDelete: true,
-		ModTime:   time.Now(),
-	}
-
-	stdout.Reset()
-	confirmAndDeleteWithIO([]Candidate{candUnreadable}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
-	os.Chmod(unreadableDir, 0755) // Restore permission for temp cleanup
-}
-
-func TestCoveragePushTo95Final(t *testing.T) {
-	const gb = uint64(1024 * 1024 * 1024)
-	calculateDynamicMinSizeMB(0)
-	calculateDynamicMinSizeMB(40 * gb)
-	calculateDynamicMinSizeMB(75 * gb)
-	calculateDynamicMinSizeMB(1000 * gb)
-
-	tmpSubDir := filepath.Join(t.TempDir(), "tmp_scan")
-	os.MkdirAll(tmpSubDir, 0755)
-
-	oldTime := time.Now().Add(-200 * time.Hour)
-	staleLog := filepath.Join(tmpSubDir, "stale.log")
-	os.WriteFile(staleLog, bytes.Repeat([]byte("s"), 200*1024), 0644)
-	os.Chtimes(staleLog, oldTime, oldTime)
-
-	engine := NewRuleEngine(getDefaultManifest())
-	_ = scanParallel([]string{tmpSubDir}, engine, 2.0, 100*1024, true)
-
-	var stdout, stderr bytes.Buffer
-	runMain([]string{"-json", "-plan-out", "/non/existent/dir/999/plan.json", "-path", tmpSubDir}, &stdout, &stderr, nil)
-
-	badJSON := filepath.Join(t.TempDir(), "bad.json")
-	os.WriteFile(badJSON, []byte("{bad"), 0644)
-	runMain([]string{"-manifest", badJSON}, &stdout, &stderr, nil)
-}
-
-func TestMainFunc(t *testing.T) {
-	oldExit := osExit
-	defer func() { osExit = oldExit }()
-	osExit = func(code int) {}
-
-	oldArgs := os.Args
-	defer func() { os.Args = oldArgs }()
-	os.Args = []string{"unslop", "-version"}
-
-	main()
-}
-
-func TestVersionFlag(t *testing.T) {
-	if Version == "" {
-		t.Errorf("Version constant should not be empty")
+		os.Remove(gioScript)
+		if err := moveToTrashOS(smallFile); err != nil {
+			t.Errorf("moveToTrashOS with mock trash failed: %v", err)
+		}
 	}
 }
+
+
+

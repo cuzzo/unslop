@@ -3,7 +3,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
@@ -36,6 +35,5 @@ func moveToTrashOS(path string) error {
 			return nil
 		}
 	}
-	script := fmt.Sprintf(`tell application "Finder" to delete POSIX file "%s"`, path)
-	return exec.Command("osascript", "-e", script).Run()
+	return exec.Command("osascript", "-e", "on run argv", "-e", "tell application \"Finder\" to delete POSIX file (item 1 of argv)", "-e", "end run", path).Run()
 }

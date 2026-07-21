@@ -89,9 +89,9 @@ type Manifest struct {
 
 // PlanReport defines the structured JSON output for dry-run/plan mode
 type PlanReport struct {
-	Version      string `json:"version"`
-	ScannedAt    string `json:"scanned_at"`
-	DiskUsage    struct {
+	Version   string `json:"version"`
+	ScannedAt string `json:"scanned_at"`
+	DiskUsage struct {
 		TotalBytes uint64 `json:"total_bytes"`
 		UsedBytes  uint64 `json:"used_bytes"`
 		FreeBytes  uint64 `json:"free_bytes"`
@@ -521,9 +521,10 @@ func isProtected(path string) bool {
 
 func containsProtectedPath(targetPath string) bool {
 	var foundProtected bool
-	filepath.WalkDir(targetPath, func(p string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(targetPath, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			foundProtected = true
+			return filepath.SkipAll
 		}
 		if isProtected(p) {
 			foundProtected = true
@@ -531,6 +532,9 @@ func containsProtectedPath(targetPath string) bool {
 		}
 		return nil
 	})
+	if err != nil {
+		return true
+	}
 	return foundProtected
 }
 
@@ -556,11 +560,37 @@ func formatUintBytes(b uint64) string {
 }
 
 func matchPattern(str, pattern string) bool {
-	matched, err := filepath.Match(strings.ToLower(pattern), strings.ToLower(str))
-	if err == nil && matched {
-		return true
+	str = strings.ToLower(filepath.ToSlash(str))
+	pattern = strings.ToLower(filepath.ToSlash(pattern))
+	if !strings.Contains(pattern, "*") && !strings.Contains(pattern, "?") {
+		return strings.Contains(str, pattern)
 	}
-	return strings.Contains(strings.ToLower(str), strings.ToLower(pattern))
+	return globMatch(pattern, str)
+}
+
+func globMatch(pattern, str string) bool {
+	px, sx := 0, 0
+	nextP, nextS := -1, -1
+	for sx < len(str) {
+		if px < len(pattern) && (pattern[px] == str[sx] || pattern[px] == '?') {
+			px++
+			sx++
+		} else if px < len(pattern) && pattern[px] == '*' {
+			nextP = px
+			nextS = sx + 1
+			px++
+		} else if nextP != -1 {
+			px = nextP + 1
+			sx = nextS
+			nextS++
+		} else {
+			return false
+		}
+	}
+	for px < len(pattern) && pattern[px] == '*' {
+		px++
+	}
+	return px == len(pattern)
 }
 
 func loadManifest(customPath string) (Manifest, error) {
@@ -634,9 +664,6 @@ func calculateDynamicMinSizeMB(diskTotalBytes uint64) float64 {
 	ratio := math.Log10(diskGB/50.0) / math.Log10(2.0)
 	val := 1.0 + ratio*9.0
 
-	if val < minFloorMB {
-		return minFloorMB
-	}
 	if val > maxCapMB {
 		return maxCapMB
 	}
@@ -673,7 +700,7 @@ func applyOverrides(engine *RuleEngine, args []string) ([]string, []string) {
 				Target:    "any",
 				Patterns:  []string{pat},
 				Category:  "Custom Pattern",
-				RiskClass: RiskRegenerable,
+				RiskClass: RiskUnknown,
 			}
 			engine.Rules = append(engine.Rules, customRule)
 			added = append(added, pat)
@@ -717,9 +744,6 @@ func renderProgressBar(percentage float64, width int) string {
 		percentage = 100
 	}
 	filled := int(math.Round(percentage / 100.0 * float64(width)))
-	if filled > width {
-		filled = width
-	}
 	return "[" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "]"
 }
 
@@ -1166,6 +1190,16 @@ func runMain(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 		return 2
 	}
 
+	if *daysFlag < 0 {
+		fmt.Fprintf(stderr, "Error: -days cannot be negative\n")
+		return 2
+	}
+
+	if *minSizeFlag < 0 {
+		fmt.Fprintf(stderr, "Error: -min-size-mb cannot be negative\n")
+		return 2
+	}
+
 	if *versionFlag {
 		fmt.Fprintf(stdout, "unslop version %s\n", Version)
 		return 0
@@ -1181,6 +1215,13 @@ func runMain(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 			minSizeSet = true
 		}
 	})
+
+	for _, p := range paths {
+		if _, err := os.Stat(p); err != nil {
+			fmt.Fprintf(stderr, "Error: scan path '%s' does not exist or is inaccessible: %v\n", p, err)
+			return 1
+		}
+	}
 
 	scanDirs := []string(paths)
 	if len(scanDirs) == 0 {
@@ -1391,6 +1432,16 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 
 			if info.IsDir() != c.IsDir {
 				fmt.Fprintf(stdout, " [ABORT] File type changed for %s! Skipping.\n", c.Path)
+				continue
+			}
+
+			if !c.IsDir && info.Size() != c.Size {
+				fmt.Fprintf(stdout, " [ABORT] File size changed for %s (scanned: %d B, current: %d B)! Skipping.\n", c.Path, c.Size, info.Size())
+				continue
+			}
+
+			if !c.ModTime.IsZero() && !info.ModTime().Equal(c.ModTime) {
+				fmt.Fprintf(stdout, " [ABORT] File modification time changed for %s! Skipping.\n", c.Path)
 				continue
 			}
 

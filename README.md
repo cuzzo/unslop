@@ -29,7 +29,7 @@ go install github.com/yahn/unslop@latest
 1. **`regenerable`** *(Safe)*: Build artifacts and compiler outputs (`.zig-cache`, `target/`, `.gradle`, `node_modules/.cache`) that can be transparently recreated by build tools.
 2. **`package-managed`** *(Toolchain)*: Binaries mapped directly to native package inventories (`cargo`, `pipx`, `npm`, `swiftly`, `sdkman`, `dotnet`, `composer`) that execute native package uninstallation.
 3. **`user-data`** *(Review-Only / Opt-In)*: Local LLM model weights, AI agent conversation histories, logs, and large JSON dumps. **Excluded by default unless `--include-data` is specified.**
-4. **`unknown`** *(Custom)*: Custom user-defined patterns.
+4. **`unknown`** *(Report-Only / Custom)*: Custom user-defined patterns (`+pattern`) and unverified binary paths. **Never automatically deleted in `-apply` mode.**
 
 ---
 
@@ -74,7 +74,7 @@ unslop -apply
     {
       "id": 1,
       "path": "/home/user/.cache/zig",
-      "size": 125829120,
+      "size_bytes": 125829120,
       "age_days": 14.2,
       "category": "Cache Dir",
       "rule_id": "zig_cache",
@@ -83,8 +83,7 @@ unslop -apply
       "evidence": "Last modified 14.2 days ago, total size 120.0 MB across 45 files",
       "proposed_action": "delete_dir",
       "is_dir": true,
-      "file_count": 45,
-      "is_data": false
+      "file_count": 45
     }
   ]
 }
@@ -95,15 +94,7 @@ unslop -apply
 ## Safety Architecture
 
 - **Single-Pass High Performance Scan**: Fast parallel filesystem traversal without double scanning.
-- **Subtree Protection Guard**: Verifies candidate subtrees before removal to prevent deleting protected configuration, credentials, or agent memory files.
-- **Pre-Deletion Path Re-Validation**: Verifies file modification times, file size, and item types directly before execution to prevent operating on stale scan snapshots.
-- **Sanitized Previews**: Automatically redacts API keys, JWT tokens, and private keys in TUI preview panes.
-- **No Shell Expansion**: Executes package manager actions via direct typed argument arrays without shell string parsing (`sh -c`).
-
----
-
-## License
-
-[BSD 3-Clause License](LICENSE)
-
-
+- **Fail-Closed Subtree Protection Guard**: Traverses candidate subtrees and fails closed on unreadable or permission-restricted subdirectories to prevent deleting protected credential, configuration, or agent memory files.
+- **Fail-Closed Pre-Action Fingerprint Revalidation**: Revalidates candidate file size (`size_bytes`), modification time (`ModTime`), file item type (`IsDir`), and path existence directly before execution. Aborts deletion if any attribute mutated since the scan snapshot.
+- **Unknown / Custom Pattern Report-Only Isolation**: Custom user patterns added via `+pattern` are classified as `unknown` risk class and are strictly report-only (`CanDelete = false`). They are never deleted automatically in `--apply` mode.
+- **Injection-Safe Parameterized Trash Handlers**: Employs parameterized command invocation on Windows (`powershell -LiteralPath`) and macOS (`osascript argv`) to prevent shell injection or path escaping.

@@ -3,7 +3,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
@@ -40,6 +39,6 @@ func getDiskSpaceSyscall(path string) (uint64, uint64, uint64, error) {
 }
 
 func moveToTrashOS(path string) error {
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", fmt.Sprintf("Remove-Item -Path '%s' -Recycle -Force", path))
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", "param($p); Remove-Item -LiteralPath $p -Recycle -Force", path)
 	return cmd.Run()
 }
