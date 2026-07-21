@@ -106,10 +106,46 @@
     },
     {
       "id": "agent_logs",
-      "name": "AI Agent Logs",
+      "name": "AI & IDE Logs",
       "target": "any",
-      "patterns": [".claude/debug", ".gemini/antigravity-cli/log", ".gemini/antigravity-cli/crashes", ".config/Cursor/logs"],
-      "category": "Agent Log",
+      "patterns": [
+        ".claude/debug",
+        ".gemini/antigravity-cli/log",
+        ".gemini/antigravity-cli/crashes",
+        ".config/Cursor/logs",
+        ".config/Code/logs",
+        "Library/Application Support/Code/logs",
+        "Library/Application Support/Cursor/logs"
+      ],
+      "category": "IDE & AI Log",
+      "risk_class": "user-data"
+    },
+    {
+      "id": "system_app_logs",
+      "name": "System & Application Logs",
+      "target": "any",
+      "patterns": [
+        "Library/Logs",
+        ".local/share/logs",
+        ".local/share/xorg"
+      ],
+      "category": "System/App Log",
+      "risk_class": "user-data"
+    },
+    {
+      "id": "devops_container_logs",
+      "name": "DevOps & Rotated Logs",
+      "target": "any",
+      "patterns": [
+        "npm-debug.log*",
+        "yarn-error.log*",
+        "pnpm-debug.log*",
+        "*.log.gz",
+        "*.log.1",
+        "*.log.2",
+        "*.log.old"
+      ],
+      "category": "DevOps/Rotated Log",
       "risk_class": "user-data"
     },
     {
@@ -141,7 +177,7 @@
       "id": "log_files",
       "name": "Log Files",
       "target": "file",
-      "patterns": ["*.log", "*.err", "*.out"],
+      "patterns": ["*.log", "*.err", "*.out", "*.log.*"],
       "category": "Log File",
       "risk_class": "user-data"
     },
