@@ -1,7 +1,10 @@
-# unslop
+# unslop (Experimental Read-Only Alpha v0.2.0)
 
-> **What**: `unslop` is a high-performance interactive TUI tool that discovers and cleans stale build caches, AI agent logs, unused toolchain packages, and LLM weights across your system.
-> **Why**: Use it to safely reclaim gigabytes of disk space wasted by developer build tools and local AI workflows with multi-layered path safeguards, structured package manager uninstallation, and pre-deletion path re-validation.
+> **What**: `unslop` is an experimental, conservative developer-workstation hygiene planner that analyzes build caches, toolchain artifacts, AI agent logs, and model weights across your system.
+> **Why**: Use it to inspect, explain, and plan disk reclamation across developer tools and AI workflows with explicit risk classification, structured package provenance, JSON plan export, and multi-layered safety guards.
+
+> [!IMPORTANT]
+> `unslop` is currently in **Experimental Read-Only Alpha**. It defaults to plan and report mode. Deletion mode requires explicit `--apply` opt-in.
 
 ---
 
@@ -13,64 +16,92 @@ Install via standard Go tooling:
 go install github.com/yahn/unslop@latest
 ```
 
----
-
-## Features
-
-- **Full-Width TUI with Live Inspection**: Select items using `SPACE` or `TAB` with a bottom preview window displaying line previews and item metadata.
-- **Fail-Closed Declarative Engine**: Configured via JSON rule manifests to scan build caches (`.zig-cache`, `target/`), LLM weights (`.gguf`, `.safetensors`), AI agent sessions (`Codex`, `Claude`, `Gemini`, `Cursor`), and verified unused package binaries.
-- **Structured Toolchain Uninstallation**: Maps installed package inventories (`~/.cargo/.crates.toml`, `pipx`, `npm`, `swiftly`, `sdkman`, `dotnet`, `composer`) and executes uninstallation via direct argument arrays without shell expansion (`sh -c`).
-- **Data vs Cache Categorization**: Default scans focus on safe, regenerable build caches (`.zig-cache`, `target/`, `.gradle`, `node_modules/.cache`). User data and model weights require explicit `--include-data` review opt-in.
-- **Multi-Layered Safeguards**:
-  - **Subtree Protection Guard**: Verifies candidate subtrees before removal to prevent deleting protected configuration, credentials, or agent memory files.
-  - **Pre-Deletion Path Re-Validation**: Verifies file modification times, file size, and item types directly before execution to prevent operating on stale scan snapshots.
-  - **System Trash Support**: Optional `--trash` flag moves items to system trash instead of permanent deletion.
+### Dependencies
+- **Go**: Version 1.22+
+- **FZF (Optional)**: `fzf` for interactive terminal UI filtering. If `fzf` is absent, `unslop` outputs a clean, structured text plan report.
 
 ---
 
-## Quick Start
+## Risk Classes
+
+`unslop` categorizes all candidates into explicit risk levels:
+
+1. **`regenerable`** *(Safe)*: Build artifacts and compiler outputs (`.zig-cache`, `target/`, `.gradle`, `node_modules/.cache`) that can be transparently recreated by build tools.
+2. **`package-managed`** *(Toolchain)*: Binaries mapped directly to native package inventories (`cargo`, `pipx`, `npm`, `swiftly`, `sdkman`, `dotnet`, `composer`) that execute native package uninstallation.
+3. **`user-data`** *(Review-Only / Opt-In)*: Local LLM model weights, AI agent conversation histories, logs, and large JSON dumps. **Excluded by default unless `--include-data` is specified.**
+4. **`unknown`** *(Custom)*: Custom user-defined patterns.
+
+---
+
+## Usage & Commands
 
 ```bash
-# Run unslop interactively (scans safe regenerable build caches)
+# Run in default Read-Only Plan Mode (scans safe regenerable caches)
 unslop
+
+# Export structured JSON plan report
+unslop -json -plan-out plan.json
 
 # Include user data, AI agent sessions, and LLM weights for review
 unslop -include-data
 
-# Move candidates to Trash instead of permanently deleting
-unslop -trash
-
 # Custom age window (e.g. 14 days) and minimum size (e.g. 10 MB)
 unslop -days 14 -min-size-mb 10
 
-# Scan specific directories in dry-run mode
-unslop -path ~/.cache -path /tmp -dry-run
+# Move candidates to Trash instead of permanent deletion
+unslop -trash -apply
+
+# Enable permanent deletion mode (requires explicit -apply)
+unslop -apply
 ```
 
 ---
 
-## Configuration & Manifest Hierarchy
+## Structured JSON Plan Output (`-json` / `-plan-out`)
 
-`unslop` resolves manifest rules in the following strict order of precedence:
-
-1. **Explicit CLI Flag**: `-manifest /path/to/custom.json` (Fails closed immediately if invalid or missing)
-2. **User Home Override**: `~/.unslop.json`
-3. **XDG Config Directory**: `~/.config/unslop/manifest.json` (or `$XDG_CONFIG_HOME`)
-4. **Embedded Default Manifest**: Embedded at compile time via `//go:embed`.
+```json
+{
+  "version": "0.2.0-alpha",
+  "scanned_at": "2026-07-21T14:35:00Z",
+  "disk_usage": {
+    "total_bytes": 1073741824000,
+    "used_bytes": 429496729600,
+    "free_bytes": 644245094400
+  },
+  "total_candidates": 1,
+  "total_size_bytes": 125829120,
+  "candidates": [
+    {
+      "id": 1,
+      "path": "/home/user/.cache/zig",
+      "size": 125829120,
+      "age_days": 14.2,
+      "category": "Cache Dir",
+      "rule_id": "zig_cache",
+      "risk_class": "regenerable",
+      "reason": "Stale build cache unused for 14.2 days",
+      "evidence": "Last modified 14.2 days ago, total size 120.0 MB across 45 files",
+      "proposed_action": "delete_dir",
+      "is_dir": true,
+      "file_count": 45,
+      "is_data": false
+    }
+  ]
+}
+```
 
 ---
 
-## Comparison
+## Safety Architecture
 
-| Tool | Declarative Custom Rules | Structured Toolchain Uninstallation | Subtree Safeguards & Re-Validation | Review-Only Data Opt-In |
-| :--- | :--- | :--- | :--- | :--- |
-| **`unslop`** | **Yes** (JSON manifest) | **Yes** (cargo, npm, pipx, swiftly, sdkman, dotnet, composer) | **Yes** (Subtree guard + `lstat` snapshot recheck) | **Yes** (`--include-data`) |
-| **[Kondo](https://github.com/tbillington/kondo)** | No | No (Direct directory removal) | No | No |
-| **[dua-cli](https://github.com/Byron/dua-cli)** | No | No | No | No |
-| **[ncdu](https://dev.lollogobaldo.com/ncdu/)** | No | No | No | No |
+- **Single-Pass High Performance Scan**: Fast parallel filesystem traversal without double scanning.
+- **Subtree Protection Guard**: Verifies candidate subtrees before removal to prevent deleting protected configuration, credentials, or agent memory files.
+- **Pre-Deletion Path Re-Validation**: Verifies file modification times, file size, and item types directly before execution to prevent operating on stale scan snapshots.
+- **Sanitized Previews**: Automatically redacts API keys, JWT tokens, and private keys in TUI preview panes.
+- **No Shell Expansion**: Executes package manager actions via direct typed argument arrays without shell string parsing (`sh -c`).
 
 ---
 
 ## License
 
-MIT License.
+[MIT License](LICENSE)

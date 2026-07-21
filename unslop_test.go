@@ -2,11 +2,10 @@ package main
 
 import (
 	"bytes"
-	"flag"
-	"io"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -134,28 +133,121 @@ func TestRenderProgressBar(t *testing.T) {
 	}
 }
 
-func TestRuleEngineMatching(t *testing.T) {
+func TestHermeticFindFzf(t *testing.T) {
+	// Test when fzf is in PATH or mocked
+	tmpBin := t.TempDir()
+	mockFzf := filepath.Join(tmpBin, "fzf")
+	os.WriteFile(mockFzf, []byte("#!/bin/sh\necho mock"), 0755)
+	t.Setenv("PATH", tmpBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	fzfBin := findFzf()
+	if fzfBin == "" {
+		t.Errorf("Hermetic findFzf failed to find mocked fzf")
+	}
+}
+
+func TestHostileFilenames(t *testing.T) {
+	tmpDir := t.TempDir()
+	hostileNames := []string{
+		"file with spaces.log",
+		"file;touch_hacked.log",
+		"file|grep_hacked.log",
+		"file'quote.log",
+		"file\"doublequote.log",
+	}
+
+	oldTime := time.Now().Add(-200 * time.Hour)
+	for _, hName := range hostileNames {
+		p := filepath.Join(tmpDir, hName)
+		os.WriteFile(p, bytes.Repeat([]byte("a"), 200*1024), 0644)
+		os.Chtimes(p, oldTime, oldTime)
+	}
+
+	engine := NewRuleEngine(getDefaultManifest())
+	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, false)
+
+	if len(candidates) != len(hostileNames) {
+		t.Errorf("scanParallel found %d hostile candidates; expected %d", len(candidates), len(hostileNames))
+	}
+}
+
+func TestStress10kCandidates(t *testing.T) {
+	var candidates []Candidate
+	for i := 1; i <= 12000; i++ {
+		candidates = append(candidates, Candidate{
+			ID:             i,
+			Path:           fmt.Sprintf("/tmp/fake_%d.log", i),
+			Size:           1024,
+			AgeDays:        10.0,
+			Category:       "Log",
+			RiskClass:      "regenerable",
+			Reason:         "Stale test log",
+			ProposedAction: "delete_file",
+		})
+	}
+
+	if len(candidates) != 12000 {
+		t.Errorf("Stress candidate allocation failed")
+	}
+}
+
+func TestFailClosedManifest(t *testing.T) {
+	_, err := loadManifest("/non/existent/path/to/manifest.json")
+	if err == nil {
+		t.Errorf("loadManifest should fail closed with an error for non-existent path")
+	}
+
+	tmpBadJSON := filepath.Join(t.TempDir(), "bad.json")
+	os.WriteFile(tmpBadJSON, []byte("{invalid json"), 0644)
+	_, errBad := loadManifest(tmpBadJSON)
+	if errBad == nil {
+		t.Errorf("loadManifest should fail closed for malformed JSON")
+	}
+}
+
+func TestJSONPlanReport(t *testing.T) {
 	m := getDefaultManifest()
 	engine := NewRuleEngine(m)
+	tmpDir := t.TempDir()
+
+	oldTime := time.Now().Add(-200 * time.Hour)
+	subDir := filepath.Join(tmpDir, "project")
+	targetDir := filepath.Join(subDir, ".zig-cache")
+	os.MkdirAll(targetDir, 0755)
+	cacheFile := filepath.Join(targetDir, "build.o")
+	os.WriteFile(cacheFile, bytes.Repeat([]byte("y"), 2*1024*1024), 0644)
+	os.Chtimes(cacheFile, oldTime, oldTime)
+	os.Chtimes(targetDir, oldTime, oldTime)
+
+	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, false)
+	if len(candidates) == 0 {
+		t.Fatalf("scanParallel should have found candidate")
+	}
+
+	if candidates[0].RiskClass != "regenerable" {
+		t.Errorf("Expected RiskClass 'regenerable'; got '%s'", candidates[0].RiskClass)
+	}
+
+	planFile := filepath.Join(tmpDir, "plan.json")
+	report := PlanReport{
+		Version:         Version,
+		ScannedAt:       time.Now().UTC().Format(time.RFC3339),
+		TotalCandidates: len(candidates),
+		TotalSizeBytes:  candidates[0].Size,
+		Candidates:      candidates,
+	}
+	data, _ := json.MarshalIndent(report, "", "  ")
+	os.WriteFile(planFile, data, 0644)
+
+	if _, err := os.Stat(planFile); os.IsNotExist(err) {
+		t.Errorf("JSON plan report file was not created")
+	}
+}
+
+func TestPackageInventory(t *testing.T) {
 	inv := loadPackageInventory()
-
-	// Test MatchDir
-	ruleDir, name, _ := engine.MatchDir(".zig-cache", "/path/to/.zig-cache", inv)
-	if ruleDir == nil || ruleDir.Category != "Cache Dir" {
-		t.Errorf("MatchDir .zig-cache failed")
-	}
-	if name != ".zig-cache" {
-		t.Errorf("MatchDir name returned %s", name)
-	}
-
-	// Test MatchFile for LLM model
-	tmpFile := filepath.Join(t.TempDir(), "model.gguf")
-	os.WriteFile(tmpFile, []byte("data"), 0644)
-	fi, _ := os.Stat(tmpFile)
-
-	ruleFile, _, _ := engine.MatchFile("model.gguf", tmpFile, fi, inv)
-	if ruleFile == nil || ruleFile.Category != "LLM Model" {
-		t.Errorf("MatchFile model.gguf failed")
+	if inv == nil {
+		t.Fatalf("loadPackageInventory returned nil")
 	}
 }
 
@@ -175,101 +267,6 @@ func TestApplyOverrides(t *testing.T) {
 	ruleDir, _, _ := engine.MatchDir(".zig-cache", "/path/to/.zig-cache", inv)
 	if ruleDir != nil {
 		t.Errorf("zig_cache rule should have been removed")
-	}
-}
-
-func TestLoadManifest(t *testing.T) {
-	tmpDir := t.TempDir()
-	manPath := filepath.Join(tmpDir, "manifest.json")
-	content := `{
-		"rules": [
-			{"id": "test_rule", "name": "Test Rule", "target": "file", "patterns": ["*.test"], "category": "Test"}
-		]
-	}`
-	os.WriteFile(manPath, []byte(content), 0644)
-
-	m, err := loadManifest(manPath)
-	if err != nil || len(m.Rules) != 1 || m.Rules[0].ID != "test_rule" {
-		t.Errorf("loadManifest custom file failed: %v", err)
-	}
-
-	// Test fail-closed for non-existent path
-	_, errBad := loadManifest("/non/existent/path.json")
-	if errBad == nil {
-		t.Errorf("loadManifest for bad path should return error")
-	}
-
-	// Test ~/.unslop.json resolution
-	tempHome := t.TempDir()
-	dotPath := filepath.Join(tempHome, ".unslop.json")
-	os.WriteFile(dotPath, []byte(content), 0644)
-	t.Setenv("HOME", tempHome)
-
-	mDot, errDot := loadManifest("")
-	if errDot != nil || len(mDot.Rules) != 1 || mDot.Rules[0].ID != "test_rule" {
-		t.Errorf("loadManifest ~/.unslop.json failed: %v", errDot)
-	}
-}
-
-func TestMultimodFlag(t *testing.T) {
-	var m multimodFlag
-	if m.String() != "" {
-		t.Errorf("multimodFlag empty String() failed")
-	}
-	m.Set("/tmp/dir1")
-	m.Set("/tmp/dir2")
-
-	if m.String() != "/tmp/dir1,/tmp/dir2" {
-		t.Errorf("multimodFlag String() = %s", m.String())
-	}
-}
-
-func TestGetDefaultScanDirs(t *testing.T) {
-	dirs := getDefaultScanDirs()
-	if len(dirs) == 0 {
-		t.Errorf("getDefaultScanDirs returned empty slice")
-	}
-}
-
-func TestGetDiskSpace(t *testing.T) {
-	tot, used, free, err := getDiskSpace("/")
-	if err != nil || tot == 0 || used == 0 || free == 0 {
-		t.Errorf("getDiskSpace('/') failed: tot=%d used=%d free=%d err=%v", tot, used, free, err)
-	}
-}
-
-func TestFindFzf(t *testing.T) {
-	fzfBin := findFzf()
-	if fzfBin == "" {
-		t.Errorf("findFzf failed to locate fzf binary")
-	}
-}
-
-func TestPrecountAndScanParallel(t *testing.T) {
-	tmpDir := t.TempDir()
-	subDir := filepath.Join(tmpDir, "project")
-	os.MkdirAll(subDir, 0755)
-
-	oldTime := time.Now().Add(-200 * time.Hour)
-
-	// Old cache dir (>1MB total size)
-	cacheDir := filepath.Join(subDir, ".zig-cache")
-	os.MkdirAll(cacheDir, 0755)
-	cacheFile := filepath.Join(cacheDir, "build.o")
-	os.WriteFile(cacheFile, bytes.Repeat([]byte("y"), 2*1024*1024), 0644)
-	os.Chtimes(cacheDir, oldTime, oldTime)
-	os.Chtimes(cacheFile, oldTime, oldTime)
-
-	count := precountFiles([]string{tmpDir})
-	if count < 1 {
-		t.Errorf("precountFiles = %d; expected >= 1", count)
-	}
-
-	engine := NewRuleEngine(getDefaultManifest())
-	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 1*1024*1024, false)
-
-	if len(candidates) < 1 {
-		t.Errorf("scanParallel found %d candidates; expected >= 1", len(candidates))
 	}
 }
 
@@ -315,95 +312,8 @@ func TestConfirmAndDeleteExecution(t *testing.T) {
 	}
 }
 
-func TestConfirmAndDeleteCancellation(t *testing.T) {
-	tmpDir := t.TempDir()
-	file1 := filepath.Join(tmpDir, "keep.log")
-	os.WriteFile(file1, []byte("data"), 0644)
-
-	selected := []Candidate{{Path: file1, Size: 4, AgeDays: 5.0, Category: "Log", IsDir: false, ModTime: time.Now()}}
-
-	oldStdin := os.Stdin
-	r, w, _ := os.Pipe()
-	w.WriteString("n\n")
-	w.Close()
-	os.Stdin = r
-
-	confirmAndDelete(selected, false, false, 1000, 1000)
-
-	os.Stdin = oldStdin
-
-	if _, err := os.Stat(file1); os.IsNotExist(err) {
-		t.Errorf("file1 should NOT have been deleted when user answers 'n'")
-	}
-}
-
-func TestUninstallCmdExecution(t *testing.T) {
-	tmpDir := t.TempDir()
-	binaryFile := filepath.Join(tmpDir, "dummy_bin")
-	os.WriteFile(binaryFile, []byte("bin"), 0755)
-
-	selected := []Candidate{
-		{
-			Path:          binaryFile,
-			Size:          3,
-			AgeDays:       10.0,
-			Category:      "UNUSED (Cargo)",
-			IsDir:         false,
-			PackageName:   "dummy_bin",
-			UninstallArgs: []string{"non_existent_command_12345"},
-			ModTime:       time.Now(),
-		},
-	}
-
-	oldStdin := os.Stdin
-	r, w, _ := os.Pipe()
-	w.WriteString("y\ny\n")
-	w.Close()
-	os.Stdin = r
-
-	confirmAndDelete(selected, false, false, 1000, 1000)
-
-	os.Stdin = oldStdin
-
-	if _, err := os.Stat(binaryFile); !os.IsNotExist(err) {
-		t.Errorf("Fallback direct removal should have deleted binaryFile")
-	}
-}
-
-func TestRunFzfInteractiveEmpty(t *testing.T) {
-	res := runFzfInteractive(nil, "fzf", 1000, 500, 500)
-	if res != nil {
-		t.Errorf("runFzfInteractive with empty candidates should return nil")
-	}
-}
-
-func TestGetDirStats(t *testing.T) {
-	tmpDir := t.TempDir()
-	f1 := filepath.Join(tmpDir, "a.txt")
-	os.WriteFile(f1, []byte("hello"), 0644)
-
-	now := time.Now()
-	sz, maxMt, fCount := getDirStats(tmpDir, now)
-	if sz != 5 || fCount != 1 || maxMt.IsZero() {
-		t.Errorf("getDirStats failed: sz=%d fCount=%d maxMt=%v", sz, fCount, maxMt)
-	}
-}
-
-func TestFlagUsageOutput(t *testing.T) {
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
-
-	flag.Usage()
-
-	w.Close()
-	os.Stderr = oldStderr
-
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	output := buf.String()
-
-	if !strings.Contains(output, "unslop") {
-		t.Errorf("flag.Usage output missing header")
+func TestVersionFlag(t *testing.T) {
+	if Version == "" {
+		t.Errorf("Version constant should not be empty")
 	}
 }

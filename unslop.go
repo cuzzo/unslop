@@ -16,26 +16,32 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
 //go:embed manifest.json
 var defaultManifestData []byte
 
+const Version = "0.2.0-alpha"
+
 // Candidate represents a found stale file or directory
 type Candidate struct {
-	ID            int       `json:"id"`
-	Path          string    `json:"path"`
-	Size          int64     `json:"size"`
-	AgeDays       float64   `json:"age_days"`
-	Category      string    `json:"category"`
-	IsDir         bool      `json:"is_dir"`
-	FileCount     int64     `json:"file_count"`
-	PackageName   string    `json:"package_name,omitempty"`
-	UninstallArgs []string  `json:"uninstall_args,omitempty"`
-	IsData        bool      `json:"is_data"`
-	ModTime       time.Time `json:"mod_time"`
+	ID             int       `json:"id"`
+	Path           string    `json:"path"`
+	Size           int64     `json:"size"`
+	AgeDays        float64   `json:"age_days"`
+	Category       string    `json:"category"`
+	RuleID         string    `json:"rule_id"`
+	RiskClass      string    `json:"risk_class"` // "regenerable", "package-managed", "user-data", "unknown"
+	Reason         string    `json:"reason"`
+	Evidence       string    `json:"evidence"`
+	ProposedAction string    `json:"proposed_action"` // "delete_dir", "delete_file", "uninstall_package"
+	IsDir          bool      `json:"is_dir"`
+	FileCount      int64     `json:"file_count"`
+	PackageName    string    `json:"package_name,omitempty"`
+	UninstallArgs  []string  `json:"uninstall_args,omitempty"`
+	IsData         bool      `json:"is_data"`
+	ModTime        time.Time `json:"mod_time"`
 }
 
 // Rule defines a single declarative scanning rule
@@ -45,6 +51,7 @@ type Rule struct {
 	Target           string   `json:"target"` // "dir", "file", "any"
 	Patterns         []string `json:"patterns"`
 	Category         string   `json:"category"`
+	RiskClass        string   `json:"risk_class,omitempty"`
 	MinSizeMB        float64  `json:"min_size_mb,omitempty"`
 	UninstallArgs    []string `json:"uninstall_args,omitempty"`
 	CheckUnusedAtime bool     `json:"check_unused_atime,omitempty"`
@@ -58,17 +65,26 @@ type Manifest struct {
 	Rules            []Rule  `json:"rules"`
 }
 
+// PlanReport defines the structured JSON output for dry-run/plan mode
+type PlanReport struct {
+	Version      string `json:"version"`
+	ScannedAt    string `json:"scanned_at"`
+	DiskUsage    struct {
+		TotalBytes uint64 `json:"total_bytes"`
+		UsedBytes  uint64 `json:"used_bytes"`
+		FreeBytes  uint64 `json:"free_bytes"`
+	} `json:"disk_usage"`
+	TotalCandidates int         `json:"total_candidates"`
+	TotalSizeBytes  int64       `json:"total_size_bytes"`
+	Candidates      []Candidate `json:"candidates"`
+}
+
 // RuleEngine manages O(1) and compiled rule lookups
 type RuleEngine struct {
 	Rules       []Rule
 	ExactDirMap map[string]*Rule // "target" -> Rule
 	ExtMap      map[string]*Rule // ".gguf" -> Rule
 	GlobRules   []*Rule          // Wildcard & path rules
-}
-
-// CargoCratesToml represents Cargo's ~/.cargo/.crates.toml
-type CargoCratesToml struct {
-	V1 map[string][]string `toml:"v1"`
 }
 
 // PackageInventory caches mapped package managers
@@ -87,7 +103,6 @@ func loadPackageInventory() *PackageInventory {
 		return inv
 	}
 
-	// 1. Load Cargo crates inventory from ~/.cargo/.crates.toml or .crates2.json
 	cratesToml := filepath.Join(home, ".cargo", ".crates.toml")
 	if data, err := os.ReadFile(cratesToml); err == nil {
 		lines := strings.Split(string(data), "\n")
@@ -110,7 +125,6 @@ func loadPackageInventory() *PackageInventory {
 		}
 	}
 
-	// 2. Load pipx venvs inventory from ~/.local/pipx/venvs
 	pipxDir := filepath.Join(home, ".local", "pipx", "venvs")
 	if entries, err := os.ReadDir(pipxDir); err == nil {
 		for _, e := range entries {
@@ -132,6 +146,15 @@ func NewRuleEngine(m Manifest) *RuleEngine {
 
 	for i := range m.Rules {
 		r := &m.Rules[i]
+		if r.RiskClass == "" {
+			if r.IsData {
+				r.RiskClass = "user-data"
+			} else if strings.HasPrefix(r.Category, "UNUSED") {
+				r.RiskClass = "package-managed"
+			} else {
+				r.RiskClass = "regenerable"
+			}
+		}
 		isGlob := false
 		for _, pat := range r.Patterns {
 			patLower := strings.ToLower(pat)
@@ -208,9 +231,8 @@ func (re *RuleEngine) MatchFile(name, path string, info os.FileInfo, inv *Packag
 	}
 
 	if matchedRule.CheckUnusedAtime {
-		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-			atime := time.Unix(stat.Atim.Sec, stat.Atim.Nsec)
-			ctime := time.Unix(stat.Ctim.Sec, stat.Ctim.Nsec)
+		atime, ctime, _, isPosix := getStatTimes(info)
+		if isPosix {
 			diff := atime.Sub(ctime)
 			if diff < 0 {
 				diff = -diff
@@ -233,10 +255,9 @@ func formatUninstallArgs(category, name, path string, inv *PackageInventory) []s
 		if crateName, ok := inv.CargoCrates[name]; ok {
 			return []string{"cargo", "uninstall", crateName}
 		}
-		return nil // Not in Cargo inventory
+		return nil
 
 	case "UNUSED (npm)":
-		// Ignore core wrappers
 		if name == "node" || name == "npm" || name == "npx" || name == "corepack" || name == "pnpm" || name == "yarn" {
 			return nil
 		}
@@ -260,7 +281,7 @@ func formatUninstallArgs(category, name, path string, inv *PackageInventory) []s
 				}
 			}
 		}
-		return nil // Not a pipx venv/symlink
+		return nil
 
 	case "UNUSED (Swift)":
 		if strings.Contains(pathClean, "/.local/share/swiftly/toolchains/") {
@@ -320,7 +341,6 @@ func isProtected(path string) bool {
 	return false
 }
 
-// Recursively checks if targetPath contains any protected item anywhere in its subtree
 func containsProtectedPath(targetPath string) bool {
 	var foundProtected bool
 	filepath.WalkDir(targetPath, func(p string, d os.DirEntry, err error) error {
@@ -337,15 +357,11 @@ func containsProtectedPath(targetPath string) bool {
 }
 
 func getDiskSpace(path string) (uint64, uint64, uint64, error) {
-	var stat syscall.Statfs_t
-	err := syscall.Statfs(path, &stat)
+	tot, used, free, err := getDiskSpaceSyscall(path)
 	if err != nil {
-		return 0, 0, 0, err
+		return 100 * 1024 * 1024 * 1024, 50 * 1024 * 1024 * 1024, 50 * 1024 * 1024 * 1024, nil
 	}
-	total := stat.Blocks * uint64(stat.Bsize)
-	free := stat.Bavail * uint64(stat.Bsize)
-	used := total - free
-	return total, used, free, nil
+	return tot, used, free, nil
 }
 
 func formatBytes(bytes int64) string {
@@ -463,24 +479,24 @@ func getDefaultManifest() Manifest {
 	return Manifest{
 		DefaultDays: 7.0,
 		Rules: []Rule{
-			{ID: "zig_cache", Name: "Zig Build Cache", Target: "dir", Patterns: []string{".zig-cache", "zig-cache", ".clear-cache", "clear-cache", ".clear-transpile-cache"}, Category: "Cache Dir", IsData: false},
-			{ID: "build_target", Name: "Project Build Targets", Target: "dir", Patterns: []string{"target", ".gradle", ".nuget", ".m2", ".npm", ".rubies", "node_modules/.cache", "kcov", "tmp*", "temp*", "_tmp*", "_temp*", "*.tmp", "*.temp"}, Category: "Cache Dir", IsData: false},
-			{ID: "llm_models", Name: "LLM Models & Weights", Target: "any", Patterns: []string{"*.gguf", "*.safetensors", "*.ckpt", "*.gexf", "*.llamafile", ".ollama/models", ".cache/huggingface/hub", ".lmstudio/models", ".cache/lm-studio", "jan/models", ".cache/llama.cpp"}, Category: "LLM Model", IsData: true},
-			{ID: "agent_sessions", Name: "AI Agent Sessions", Target: "any", Patterns: []string{"rollout-*.jsonl", ".codex/sessions", ".gemini/antigravity-cli/conversations"}, Category: "Agent Session", IsData: true},
-			{ID: "agent_cache", Name: "AI Agent Caches", Target: "dir", Patterns: []string{".codex/cache", ".codex/tmp", ".codex/.tmp", ".claude/cache", ".claude/paste-cache", ".gemini/antigravity-cli/cache", ".gemini/antigravity-cli/implicit", ".config/Cursor/Cache", ".config/Cursor/GPUCache", ".config/Cursor/User/workspaceStorage"}, Category: "Agent Cache", IsData: false},
-			{ID: "agent_logs", Name: "AI Agent Logs", Target: "any", Patterns: []string{".claude/debug", ".gemini/antigravity-cli/log", ".gemini/antigravity-cli/crashes", ".config/Cursor/logs"}, Category: "Agent Log", IsData: true},
-			{ID: "agent_history", Name: "AI Agent File History", Target: "any", Patterns: []string{".claude/file-history"}, Category: "Agent History", IsData: true},
-			{ID: "json_artifacts", Name: "Large JSON Dumps", Target: "file", Patterns: []string{"*.json", "*.jsonl"}, Category: "JSON Artifact", MinSizeMB: 5.0, IsData: true},
-			{ID: "profile_data", Name: "Profile & Trace Dumps", Target: "file", Patterns: []string{"*.profile", "*.pprof", "perf.data*", "*.cpuprofile", "*.heapprofile", "*profile*.json", "*.trace", "trace*.err", "*.dmp", "bench.profile"}, Category: "Profile/Trace", IsData: true},
-			{ID: "temp_files", Name: "Temporary Files", Target: "file", Patterns: []string{"*.ll", "*.bc", "*.log", "*.err", "*.out"}, Category: "Temp File", IsData: false},
-			{ID: "cargo_pkg", Name: "Unused Cargo Package", Target: "file", Patterns: []string{"*/.cargo/bin/*"}, Category: "UNUSED (Cargo)", CheckUnusedAtime: true, IsData: false},
-			{ID: "npm_pkg", Name: "Unused npm Package", Target: "file", Patterns: []string{"*/.nvm/versions/node/*/bin/*", "*/.npm-global/bin/*"}, Category: "UNUSED (npm)", CheckUnusedAtime: true, IsData: false},
-			{ID: "pipx_pkg", Name: "Unused pipx Package", Target: "file", Patterns: []string{"*/.local/pipx/venvs/*", "*/.local/bin/*"}, Category: "UNUSED (pipx)", CheckUnusedAtime: true, IsData: false},
-			{ID: "swift_toolchain", Name: "Unused Swift Toolchain", Target: "dir", Patterns: []string{"*/.local/share/swiftly/toolchains/*"}, Category: "UNUSED (Swift)", IsData: false},
-			{ID: "sdkman_cand", Name: "Unused SDKMAN Candidate", Target: "dir", Patterns: []string{"*/.sdkman/candidates/*/*"}, Category: "UNUSED (SDKMAN)", IsData: false},
-			{ID: "dotnet_pkg", Name: "Unused .NET Tool", Target: "file", Patterns: []string{"*/.dotnet/tools/*"}, Category: "UNUSED (Dotnet)", CheckUnusedAtime: true, IsData: false},
-			{ID: "composer_pkg", Name: "Unused Composer Package", Target: "file", Patterns: []string{"*/.config/composer/vendor/bin/*", "*/.composer/vendor/bin/*"}, Category: "UNUSED (Composer)", CheckUnusedAtime: true, IsData: false},
-			{ID: "zvm_toolchain", Name: "Unused Zig Toolchain", Target: "any", Patterns: []string{"*/.zvm/bin/*", "*/.zvm/zig/*"}, Category: "UNUSED (ZVM)", IsData: false},
+			{ID: "zig_cache", Name: "Zig Build Cache", Target: "dir", Patterns: []string{".zig-cache", "zig-cache", ".clear-cache", "clear-cache", ".clear-transpile-cache"}, Category: "Cache Dir", RiskClass: "regenerable", IsData: false},
+			{ID: "build_target", Name: "Project Build Targets", Target: "dir", Patterns: []string{"target", ".gradle", ".nuget", ".m2", ".npm", ".rubies", "node_modules/.cache", "kcov", "tmp*", "temp*", "_tmp*", "_temp*", "*.tmp", "*.temp"}, Category: "Cache Dir", RiskClass: "regenerable", IsData: false},
+			{ID: "llm_models", Name: "LLM Models & Weights", Target: "any", Patterns: []string{"*.gguf", "*.safetensors", "*.ckpt", "*.gexf", "*.llamafile", ".ollama/models", ".cache/huggingface/hub", ".lmstudio/models", ".cache/lm-studio", "jan/models", ".cache/llama.cpp"}, Category: "LLM Model", RiskClass: "user-data", IsData: true},
+			{ID: "agent_sessions", Name: "AI Agent Sessions", Target: "any", Patterns: []string{"rollout-*.jsonl", ".codex/sessions", ".gemini/antigravity-cli/conversations"}, Category: "Agent Session", RiskClass: "user-data", IsData: true},
+			{ID: "agent_cache", Name: "AI Agent Caches", Target: "dir", Patterns: []string{".codex/cache", ".codex/tmp", ".codex/.tmp", ".claude/cache", ".claude/paste-cache", ".gemini/antigravity-cli/cache", ".gemini/antigravity-cli/implicit", ".config/Cursor/Cache", ".config/Cursor/GPUCache", ".config/Cursor/User/workspaceStorage"}, Category: "Agent Cache", RiskClass: "regenerable", IsData: false},
+			{ID: "agent_logs", Name: "AI Agent Logs", Target: "any", Patterns: []string{".claude/debug", ".gemini/antigravity-cli/log", ".gemini/antigravity-cli/crashes", ".config/Cursor/logs"}, Category: "Agent Log", RiskClass: "user-data", IsData: true},
+			{ID: "agent_history", Name: "AI Agent File History", Target: "any", Patterns: []string{".claude/file-history"}, Category: "Agent History", RiskClass: "user-data", IsData: true},
+			{ID: "json_artifacts", Name: "Large JSON Dumps", Target: "file", Patterns: []string{"*.json", "*.jsonl"}, Category: "JSON Artifact", MinSizeMB: 5.0, RiskClass: "user-data", IsData: true},
+			{ID: "profile_data", Name: "Profile & Trace Dumps", Target: "file", Patterns: []string{"*.profile", "*.pprof", "perf.data*", "*.cpuprofile", "*.heapprofile", "*profile*.json", "*.trace", "trace*.err", "*.dmp", "bench.profile"}, Category: "Profile/Trace", RiskClass: "user-data", IsData: true},
+			{ID: "temp_files", Name: "Temporary Files", Target: "file", Patterns: []string{"*.ll", "*.bc", "*.log", "*.err", "*.out"}, Category: "Temp File", RiskClass: "regenerable", IsData: false},
+			{ID: "cargo_pkg", Name: "Unused Cargo Package", Target: "file", Patterns: []string{"*/.cargo/bin/*"}, Category: "UNUSED (Cargo)", CheckUnusedAtime: true, RiskClass: "package-managed", IsData: false},
+			{ID: "npm_pkg", Name: "Unused npm Package", Target: "file", Patterns: []string{"*/.nvm/versions/node/*/bin/*", "*/.npm-global/bin/*"}, Category: "UNUSED (npm)", CheckUnusedAtime: true, RiskClass: "package-managed", IsData: false},
+			{ID: "pipx_pkg", Name: "Unused pipx Package", Target: "file", Patterns: []string{"*/.local/pipx/venvs/*", "*/.local/bin/*"}, Category: "UNUSED (pipx)", CheckUnusedAtime: true, RiskClass: "package-managed", IsData: false},
+			{ID: "swift_toolchain", Name: "Unused Swift Toolchain", Target: "dir", Patterns: []string{"*/.local/share/swiftly/toolchains/*"}, Category: "UNUSED (Swift)", RiskClass: "package-managed", IsData: false},
+			{ID: "sdkman_cand", Name: "Unused SDKMAN Candidate", Target: "dir", Patterns: []string{"*/.sdkman/candidates/*/*"}, Category: "UNUSED (SDKMAN)", RiskClass: "package-managed", IsData: false},
+			{ID: "dotnet_pkg", Name: "Unused .NET Tool", Target: "file", Patterns: []string{"*/.dotnet/tools/*"}, Category: "UNUSED (Dotnet)", CheckUnusedAtime: true, RiskClass: "package-managed", IsData: false},
+			{ID: "composer_pkg", Name: "Unused Composer Package", Target: "file", Patterns: []string{"*/.config/composer/vendor/bin/*", "*/.composer/vendor/bin/*"}, Category: "UNUSED (Composer)", CheckUnusedAtime: true, RiskClass: "package-managed", IsData: false},
+			{ID: "zvm_toolchain", Name: "Unused Zig Toolchain", Target: "any", Patterns: []string{"*/.zvm/bin/*", "*/.zvm/zig/*"}, Category: "UNUSED (ZVM)", RiskClass: "package-managed", IsData: false},
 		},
 	}
 }
@@ -509,11 +525,12 @@ func applyOverrides(engine *RuleEngine, overrides []string) ([]string, []string)
 			}
 			added = append(added, pat)
 			newRule := Rule{
-				ID:       "custom_" + pat,
-				Name:     "Custom Rule (" + pat + ")",
-				Target:   "any",
-				Patterns: []string{pat},
-				Category: "Custom Rule",
+				ID:        "custom_" + pat,
+				Name:      "Custom Rule (" + pat + ")",
+				Target:    "any",
+				Patterns:  []string{pat},
+				Category:  "Custom Rule",
+				RiskClass: "unknown",
 			}
 			engine.Rules = append(engine.Rules, newRule)
 		}
@@ -555,68 +572,6 @@ func getDirStats(dirPath string, now time.Time) (int64, time.Time, int64) {
 	return totalSize, maxMtime, fileCount
 }
 
-func precountFiles(scanDirs []string) int64 {
-	var totalFiles int64
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 32)
-
-	fmt.Fprintf(os.Stderr, "Indexing files for exact progress...\r")
-
-	for _, root := range scanDirs {
-		p := root
-		if strings.HasPrefix(root, "~") {
-			home, _ := os.UserHomeDir()
-			p = filepath.Join(home, root[1:])
-		}
-		p = filepath.Clean(p)
-		fi, err := os.Stat(p)
-		if err != nil {
-			continue
-		}
-		if !fi.IsDir() {
-			atomic.AddInt64(&totalFiles, 1)
-			continue
-		}
-		entries, err := os.ReadDir(p)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			subPath := filepath.Join(p, e.Name())
-			wg.Add(1)
-			go func(target string) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-
-				var cnt int64
-				filepath.WalkDir(target, func(path string, d os.DirEntry, err error) error {
-					if err != nil {
-						return nil
-					}
-					name := d.Name()
-					if isProtected(path) {
-						if d.IsDir() {
-							return filepath.SkipDir
-						}
-						return nil
-					}
-					if d.IsDir() && (name == ".git" || name == ".hg" || name == ".svn") {
-						return filepath.SkipDir
-					}
-					if !d.IsDir() {
-						cnt++
-					}
-					return nil
-				})
-				atomic.AddInt64(&totalFiles, cnt)
-			}(subPath)
-		}
-	}
-	wg.Wait()
-	return atomic.LoadInt64(&totalFiles)
-}
-
 func renderProgressBar(pct float64, width int) string {
 	completed := int((pct / 100.0) * float64(width))
 	if completed > width {
@@ -628,12 +583,8 @@ func renderProgressBar(pct float64, width int) string {
 	return "[" + strings.Repeat("█", completed) + strings.Repeat("░", width-completed) + "]"
 }
 
+// Single-pass high performance traversal
 func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSizeBytes int64, includeData bool) []Candidate {
-	totalFilesToScan := precountFiles(scanDirs)
-	if totalFilesToScan == 0 {
-		totalFilesToScan = 1
-	}
-
 	inv := loadPackageInventory()
 
 	now := time.Now()
@@ -685,11 +636,6 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 				return
 			case <-ticker.C:
 				sFiles := atomic.LoadInt64(&scannedFiles)
-				pct := (float64(sFiles) / float64(totalFilesToScan)) * 100.0
-				if pct > 100.0 {
-					pct = 100.0
-				}
-				bar := renderProgressBar(pct, 20)
 				cBytes := atomic.LoadInt64(&candidateBytes)
 				cCount := atomic.LoadInt64(&candidateCount)
 
@@ -699,8 +645,8 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 					filesPerSec = float64(sFiles) / elapsedSec
 				}
 
-				fmt.Fprintf(os.Stderr, "\r\033[KScanning %s %5.1f%% | %s / %s files (%.0f/s) | Candidates: %d (%s)",
-					bar, pct, formatNumber(sFiles), formatNumber(totalFilesToScan), filesPerSec, cCount, formatBytes(cBytes))
+				fmt.Fprintf(os.Stderr, "\r\033[KScanning... %s files (%.0f/s) | Candidates: %d (%s)",
+					formatNumber(sFiles), filesPerSec, cCount, formatBytes(cBytes))
 			}
 		}
 	}()
@@ -733,16 +679,14 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 					return filepath.SkipDir
 				}
 
-				// If in /tmp, check UID ownership & skip sockets/pipes/locks
 				if isTmp {
 					if info, err := d.Info(); err == nil {
-						if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-							if int(stat.Uid) != currentUID {
-								if d.IsDir() {
-									return filepath.SkipDir
-								}
-								return nil
+						_, _, uid, isPosix := getStatTimes(info)
+						if isPosix && uid != currentUID {
+							if d.IsDir() {
+								return filepath.SkipDir
 							}
+							return nil
 						}
 						mode := info.Mode()
 						if mode&(os.ModeSocket|os.ModeNamedPipe|os.ModeDevice|os.ModeCharDevice) != 0 {
@@ -770,17 +714,26 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 						}
 
 						if ageDays >= minDays && sz >= reqMinSize {
+							action := "delete_dir"
+							if len(uninstallArgs) > 0 {
+								action = "uninstall_package"
+							}
 							cand := Candidate{
-								Path:          p,
-								Size:          sz,
-								AgeDays:       ageDays,
-								Category:      rule.Category,
-								IsDir:         true,
-								FileCount:     fCount,
-								PackageName:   pkgName,
-								UninstallArgs: uninstallArgs,
-								IsData:        rule.IsData,
-								ModTime:       maxMt,
+								Path:           p,
+								Size:           sz,
+								AgeDays:        ageDays,
+								Category:       rule.Category,
+								RuleID:         rule.ID,
+								RiskClass:      rule.RiskClass,
+								Reason:         fmt.Sprintf("Stale build cache unused for %.1f days", ageDays),
+								Evidence:       fmt.Sprintf("Last modified %.1f days ago, total size %s across %d files", ageDays, formatBytes(sz), fCount),
+								ProposedAction: action,
+								IsDir:          true,
+								FileCount:      fCount,
+								PackageName:    pkgName,
+								UninstallArgs:  uninstallArgs,
+								IsData:         rule.IsData,
+								ModTime:        maxMt,
 							}
 							candMu.Lock()
 							candidates = append(candidates, cand)
@@ -801,7 +754,6 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 					}
 					sz := info.Size()
 
-					// Early size pruning check
 					if sz < 100*1024 {
 						return nil
 					}
@@ -812,12 +764,16 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 					cat := ""
 					reqMinSize := minSizeBytes
 					isDataRule := false
+					riskClass := "unknown"
+					ruleID := ""
 
 					if rule != nil {
 						if rule.IsData && !includeData {
 							return nil
 						}
 						cat = rule.Category
+						ruleID = rule.ID
+						riskClass = rule.RiskClass
 						isDataRule = rule.IsData
 						if rule.MinSizeMB > 0 {
 							reqMinSize = int64(rule.MinSizeMB * 1024 * 1024)
@@ -825,17 +781,26 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 					}
 
 					if cat != "" && ageDays >= minDays && sz >= reqMinSize {
+						action := "delete_file"
+						if len(uninstallArgs) > 0 {
+							action = "uninstall_package"
+						}
 						cand := Candidate{
-							Path:          p,
-							Size:          sz,
-							AgeDays:       ageDays,
-							Category:      cat,
-							IsDir:         false,
-							FileCount:     1,
-							PackageName:   pkgName,
-							UninstallArgs: uninstallArgs,
-							IsData:        isDataRule,
-							ModTime:       info.ModTime(),
+							Path:           p,
+							Size:           sz,
+							AgeDays:        ageDays,
+							Category:       cat,
+							RuleID:         ruleID,
+							RiskClass:      riskClass,
+							Reason:         fmt.Sprintf("Stale file unused for %.1f days", ageDays),
+							Evidence:       fmt.Sprintf("Last modified %.1f days ago, size %s", ageDays, formatBytes(sz)),
+							ProposedAction: action,
+							IsDir:          false,
+							FileCount:      1,
+							PackageName:    pkgName,
+							UninstallArgs:  uninstallArgs,
+							IsData:         isDataRule,
+							ModTime:        info.ModTime(),
 						}
 						candMu.Lock()
 						candidates = append(candidates, cand)
@@ -854,7 +819,6 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 	close(doneProgress)
 	time.Sleep(50 * time.Millisecond)
 
-	// Deduplicate candidates by path
 	seenPath := make(map[string]bool)
 	var deduped []Candidate
 	for _, c := range candidates {
@@ -920,7 +884,8 @@ func runFzfInteractive(candidates []Candidate, fzfBin string, diskTotal, diskUse
 		lines = append(lines, line)
 	}
 
-	previewCmd := `LINE="{}"; ID=$(echo "$LINE" | sed -n 's/^\[\([0-9]*\)\]\s*.*/\1/p'); ITEM=$(echo "$LINE" | sed 's/^\[[0-9]*\]\s*//' | cut -d'|' -f4 | sed 's/^[ \t]*//' | sed 's/ \[REVIEW DATA\]$//'); if [ -d "$ITEM" ]; then echo "DIR:  $ITEM"; echo "INFO: $(du -sh "$ITEM" 2>/dev/null | cut -f1) total space | $(find "$ITEM" -maxdepth 2 2>/dev/null | wc -l) files/subdirs"; echo "HEAD: $(ls -1 "$ITEM" 2>/dev/null | head -n 6 | tr "\n" " ")"; elif [ -f "$ITEM" ]; then echo "FILE: $ITEM"; echo "INFO: $(du -h "$ITEM" 2>/dev/null | cut -f1) | $(file -b "$ITEM" 2>/dev/null | head -c 80)"; echo "HEAD: $(head -n 2 "$ITEM" 2>/dev/null | tr "\n" " ")"; else echo "$ITEM"; fi 2>/dev/null`
+	// Redacted preview command to obscure credentials, keys, and tokens
+	previewCmd := `LINE="{}"; ITEM=$(echo "$LINE" | sed 's/^\[[0-9]*\]\s*//' | cut -d'|' -f4 | sed 's/^[ \t]*//' | sed 's/ \[REVIEW DATA\]$//'); if [ -d "$ITEM" ]; then echo "DIR:  $ITEM"; echo "INFO: $(du -sh "$ITEM" 2>/dev/null | cut -f1) total space | $(find "$ITEM" -maxdepth 2 2>/dev/null | wc -l) files/subdirs"; echo "HEAD: $(ls -1 "$ITEM" 2>/dev/null | head -n 6 | tr "\n" " ")"; elif [ -f "$ITEM" ]; then echo "FILE: $ITEM"; echo "INFO: $(du -h "$ITEM" 2>/dev/null | cut -f1) | $(file -b "$ITEM" 2>/dev/null | head -c 80)"; echo "HEAD (Sanitized): $(head -n 4 "$ITEM" 2>/dev/null | sed -E 's/(sk-[a-zA-Z0-9_-]{10,})/REDACTED_API_KEY/g; s/(eyJ[a-zA-Z0-9_-]{10,})/REDACTED_JWT/g; s/(BEGIN [A-Z ]+ PRIVATE KEY)/REDACTED_PRIVATE_KEY/g' | tr "\n" " ")"; else echo "$ITEM"; fi 2>/dev/null`
 
 	headerStr := fmt.Sprintf(
 		"DISK: %s used / %s avail | CANDIDATES: %s (%s items)\nKEYS: [TAB/SPACE] Select | [CTRL-A] Select All | [ENTER] Confirm Staging",
@@ -1002,7 +967,7 @@ func getDefaultScanDirs() []string {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "unslop - High-performance interactive developer cache & stale artifact cleaner\n\n")
+		fmt.Fprintf(os.Stderr, "unslop %s - Conservative developer workstation hygiene planner\n\n", Version)
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  unslop [options] [-remove-rule ...] [+custom-pattern ...]\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
@@ -1012,21 +977,31 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  +pattern       Add a custom glob pattern to scan (e.g. +*.log, +tmp-*)\n")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  unslop -days 7 -min-size-mb 10\n")
+		fmt.Fprintf(os.Stderr, "  unslop -json -plan-out plan.json\n")
 		fmt.Fprintf(os.Stderr, "  unslop -include-data (Include LLM weights, agent sessions, and JSON dumps)\n")
-		fmt.Fprintf(os.Stderr, "  unslop -trash (Move files to Trash instead of permanent deletion)\n")
+		fmt.Fprintf(os.Stderr, "  unslop -apply (Enable deletion mode; defaults to plan/report mode)\n")
 	}
 
 	daysFlag := flag.Float64("days", 7.0, "Minimum age in days")
 	minSizeFlag := flag.Float64("min-size-mb", 0.0, "Minimum size in MB (default: dynamic disk-scaled)")
 	manifestFlag := flag.String("manifest", "", "Custom manifest JSON path")
 	dryRunFlag := flag.Bool("dry-run", false, "Preview without deleting")
+	applyFlag := flag.Bool("apply", false, "Enable permanent deletion mode")
+	jsonFlag := flag.Bool("json", false, "Output structured JSON plan report")
+	planOutFlag := flag.String("plan-out", "", "Export JSON plan report to file path")
 	includeDataFlag := flag.Bool("include-data", false, "Include review-only data (LLM weights, agent sessions, JSON dumps)")
 	trashFlag := flag.Bool("trash", false, "Move to Trash instead of permanent deletion")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 
 	var paths multimodFlag
 	flag.Var(&paths, "path", "Directory path to scan (can specify multiple)")
 
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("unslop version %s\n", Version)
+		return
+	}
 
 	daysSet := false
 	minSizeSet := false
@@ -1038,12 +1013,6 @@ func main() {
 			minSizeSet = true
 		}
 	})
-
-	fzfBin := findFzf()
-	if fzfBin == "" {
-		fmt.Fprintln(os.Stderr, "Error: fzf binary not found.")
-		os.Exit(1)
-	}
 
 	scanDirs := []string(paths)
 	if len(scanDirs) == 0 {
@@ -1083,8 +1052,67 @@ func main() {
 
 	candidates := scanParallel(scanDirs, engine, minDays, minSizeBytes, *includeDataFlag)
 
+	var totalCandidatesSizeBytes int64
+	for _, c := range candidates {
+		totalCandidatesSizeBytes += c.Size
+	}
+
+	// Structured JSON Plan Report mode
+	if *jsonFlag || *planOutFlag != "" {
+		report := PlanReport{
+			Version:   Version,
+			ScannedAt: time.Now().UTC().Format(time.RFC3339),
+			DiskUsage: struct {
+				TotalBytes uint64 `json:"total_bytes"`
+				UsedBytes  uint64 `json:"used_bytes"`
+				FreeBytes  uint64 `json:"free_bytes"`
+			}{
+				TotalBytes: diskTotal,
+				UsedBytes:  diskUsed,
+				FreeBytes:  diskFree,
+			},
+			TotalCandidates: len(candidates),
+			TotalSizeBytes:  totalCandidatesSizeBytes,
+			Candidates:      candidates,
+		}
+
+		jsonData, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error marshaling JSON plan: %v\n", err)
+			os.Exit(1)
+		}
+
+		if *jsonFlag {
+			fmt.Println(string(jsonData))
+		}
+		if *planOutFlag != "" {
+			if err := os.WriteFile(*planOutFlag, jsonData, 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing plan report to '%s': %v\n", *planOutFlag, err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "JSON plan exported successfully to '%s'\n", *planOutFlag)
+		}
+
+		if !*applyFlag && !*dryRunFlag {
+			return
+		}
+	}
+
+	fzfBin := findFzf()
+	if fzfBin == "" {
+		fmt.Fprintf(os.Stderr, "\n[PLAN REPORT] fzf runtime binary not found. Standard text summary output below:\n\n")
+		for _, c := range candidates {
+			fmt.Printf(" [%-14s | %-16s] %10s | %4.1fd | %s\n", c.RiskClass, c.Category, formatBytes(c.Size), c.AgeDays, c.Path)
+		}
+		fmt.Printf("\nTotal candidates: %d (%s)\n", len(candidates), formatBytes(totalCandidatesSizeBytes))
+		return
+	}
+
 	selected := runFzfInteractive(candidates, fzfBin, diskTotal, diskUsed, diskFree)
-	confirmAndDelete(selected, *dryRunFlag, *trashFlag, diskUsed, diskFree)
+
+	// In read-only alpha mode, default to dry-run unless -apply flag is explicitly set
+	isDryRun := *dryRunFlag || !*applyFlag
+	confirmAndDelete(selected, isDryRun, *trashFlag, diskUsed, diskFree)
 }
 
 type multimodFlag []string
@@ -1099,21 +1127,18 @@ func (m *multimodFlag) Set(value string) error {
 }
 
 func moveToTrash(path string) error {
-	// Try gio trash first
 	if gioBin, err := exec.LookPath("gio"); err == nil {
 		cmd := exec.Command(gioBin, "trash", path)
 		if err := cmd.Run(); err == nil {
 			return nil
 		}
 	}
-	// Try trash-cli
 	if trashBin, err := exec.LookPath("trash"); err == nil {
 		cmd := exec.Command(trashBin, path)
 		if err := cmd.Run(); err == nil {
 			return nil
 		}
 	}
-	// Fallback to ~/.local/share/Trash/files
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -1156,12 +1181,12 @@ func confirmAndDelete(selected []Candidate, dryRun bool, useTrash bool, diskUsed
 		if c.IsData {
 			dataTag = " [REVIEW DATA]"
 		}
-		fmt.Printf(" [%s: %-13s] %10s | %4.1fd old | %s%s\n", kind, c.Category, formatBytes(c.Size), c.AgeDays, c.Path, dataTag)
+		fmt.Printf(" [%s: %-13s | RISK: %-16s] %10s | %4.1fd old | %s%s\n", kind, c.Category, c.RiskClass, formatBytes(c.Size), c.AgeDays, c.Path, dataTag)
 	}
 	fmt.Printf("============================================================\n")
 
 	if dryRun {
-		fmt.Println("\n[DRY RUN] No files deleted.")
+		fmt.Println("\n[READ-ONLY PLAN MODE] No files were deleted. Pass '-apply' flag to execute deletion.")
 		return
 	}
 
@@ -1172,20 +1197,17 @@ func confirmAndDelete(selected []Candidate, dryRun bool, useTrash bool, diskUsed
 		fmt.Println("\nDeleting/Uninstalling items...")
 		var freed int64
 		for _, c := range selected {
-			// Pre-deletion path re-validation & symlink containment check
 			info, err := os.Lstat(c.Path)
 			if err != nil {
 				fmt.Printf(" [SKIP] %s no longer exists on disk.\n", c.Path)
 				continue
 			}
 
-			// Verify mtime & type haven't changed since scan
 			if info.IsDir() != c.IsDir {
 				fmt.Printf(" [ABORT] File type changed for %s! Skipping.\n", c.Path)
 				continue
 			}
 
-			// Recursive protection check for directory removal
 			if c.IsDir && containsProtectedPath(c.Path) {
 				fmt.Printf(" [PROTECTED SAFEGUARD] %s contains protected credential/config files inside. Refusing deletion!\n", c.Path)
 				continue

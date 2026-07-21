@@ -8,6 +8,7 @@
       "target": "dir",
       "patterns": [".zig-cache", "zig-cache", ".clear-cache", "clear-cache", ".clear-transpile-cache"],
       "category": "Cache Dir",
+      "risk_class": "regenerable",
       "is_data": false
     },
     {
@@ -16,6 +17,7 @@
       "target": "dir",
       "patterns": ["target", ".gradle", ".nuget", ".m2", ".npm", ".rubies", "node_modules/.cache", "kcov", "tmp*", "temp*", "_tmp*", "_temp*", "*.tmp", "*.temp", "*-tmp", "*-temp"],
       "category": "Cache Dir",
+      "risk_class": "regenerable",
       "is_data": false
     },
     {
@@ -24,6 +26,7 @@
       "target": "any",
       "patterns": ["*.gguf", "*.safetensors", "*.ckpt", "*.gexf", "*.llamafile", ".ollama/models", ".cache/huggingface/hub", ".lmstudio/models", ".cache/lm-studio", "jan/models", ".cache/llama.cpp"],
       "category": "LLM Model",
+      "risk_class": "user-data",
       "is_data": true
     },
     {
@@ -32,6 +35,7 @@
       "target": "any",
       "patterns": ["rollout-*.jsonl", ".codex/sessions", ".gemini/antigravity-cli/conversations"],
       "category": "Agent Session",
+      "risk_class": "user-data",
       "is_data": true
     },
     {
@@ -40,6 +44,7 @@
       "target": "dir",
       "patterns": [".codex/cache", ".codex/tmp", ".codex/.tmp", ".claude/cache", ".claude/paste-cache", ".gemini/antigravity-cli/cache", ".gemini/antigravity-cli/implicit", ".config/Cursor/Cache", ".config/Cursor/GPUCache", ".config/Cursor/User/workspaceStorage"],
       "category": "Agent Cache",
+      "risk_class": "regenerable",
       "is_data": false
     },
     {
@@ -48,6 +53,7 @@
       "target": "any",
       "patterns": [".claude/debug", ".gemini/antigravity-cli/log", ".gemini/antigravity-cli/crashes", ".config/Cursor/logs"],
       "category": "Agent Log",
+      "risk_class": "user-data",
       "is_data": true
     },
     {
@@ -56,6 +62,7 @@
       "target": "any",
       "patterns": [".claude/file-history"],
       "category": "Agent History",
+      "risk_class": "user-data",
       "is_data": true
     },
     {
@@ -65,6 +72,7 @@
       "patterns": ["*.json", "*.jsonl"],
       "category": "JSON Artifact",
       "min_size_mb": 5.0,
+      "risk_class": "user-data",
       "is_data": true
     },
     {
@@ -73,6 +81,7 @@
       "target": "file",
       "patterns": ["*.profile", "*.pprof", "perf.data*", "*.cpuprofile", "*.heapprofile", "*profile*.json", "*.trace", "trace*.err", "*.dmp", "bench.profile"],
       "category": "Profile/Trace",
+      "risk_class": "user-data",
       "is_data": true
     },
     {
@@ -81,6 +90,7 @@
       "target": "file",
       "patterns": ["*.ll", "*.bc", "*.log", "*.err", "*.out"],
       "category": "Temp File",
+      "risk_class": "regenerable",
       "is_data": false
     },
     {
@@ -90,6 +100,7 @@
       "patterns": ["*/.cargo/bin/*"],
       "category": "UNUSED (Cargo)",
       "check_unused_atime": true,
+      "risk_class": "package-managed",
       "is_data": false
     },
     {
@@ -99,6 +110,7 @@
       "patterns": ["*/.nvm/versions/node/*/bin/*", "*/.npm-global/bin/*"],
       "category": "UNUSED (npm)",
       "check_unused_atime": true,
+      "risk_class": "package-managed",
       "is_data": false
     },
     {
@@ -108,6 +120,7 @@
       "patterns": ["*/.local/pipx/venvs/*", "*/.local/bin/*"],
       "category": "UNUSED (pipx)",
       "check_unused_atime": true,
+      "risk_class": "package-managed",
       "is_data": false
     },
     {
@@ -116,6 +129,7 @@
       "target": "dir",
       "patterns": ["*/.local/share/swiftly/toolchains/*"],
       "category": "UNUSED (Swift)",
+      "risk_class": "package-managed",
       "is_data": false
     },
     {
@@ -124,6 +138,7 @@
       "target": "dir",
       "patterns": ["*/.sdkman/candidates/*/*"],
       "category": "UNUSED (SDKMAN)",
+      "risk_class": "package-managed",
       "is_data": false
     },
     {
@@ -133,6 +148,7 @@
       "patterns": ["*/.dotnet/tools/*"],
       "category": "UNUSED (Dotnet)",
       "check_unused_atime": true,
+      "risk_class": "package-managed",
       "is_data": false
     },
     {
@@ -142,6 +158,7 @@
       "patterns": ["*/.config/composer/vendor/bin/*", "*/.composer/vendor/bin/*"],
       "category": "UNUSED (Composer)",
       "check_unused_atime": true,
+      "risk_class": "package-managed",
       "is_data": false
     },
     {
@@ -150,6 +167,7 @@
       "target": "any",
       "patterns": ["*/.zvm/bin/*", "*/.zvm/zig/*"],
       "category": "UNUSED (ZVM)",
+      "risk_class": "package-managed",
       "is_data": false
     }
   ]
