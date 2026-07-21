@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -111,7 +112,7 @@ func loadPackageInventory() *PackageInventory {
 			line = strings.TrimSpace(line)
 			matches := re.FindStringSubmatch(line)
 			if len(matches) == 3 {
-				crateName := matches[1]
+				crateName := strings.Fields(matches[1])[0]
 				binListStr := matches[2]
 				binRe := regexp.MustCompile(`"([^"]+)"`)
 				binMatches := binRe.FindAllStringSubmatch(binListStr, -1)
@@ -957,7 +958,7 @@ func getDefaultScanDirs() []string {
 		p = filepath.Clean(p)
 		if !seen[p] {
 			if _, err := os.Stat(p); err == nil {
-				seen[p] = true
+					seen[p] = true
 				res = append(res, d)
 			}
 		}
@@ -965,47 +966,58 @@ func getDefaultScanDirs() []string {
 	return res
 }
 
-func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "unslop %s - Conservative developer workstation hygiene planner\n\n", Version)
-		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  unslop [options] [-remove-rule ...] [+custom-pattern ...]\n\n")
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nManifest Overrides (positional arguments):\n")
-		fmt.Fprintf(os.Stderr, "  -category      Exclude a category or rule ID (e.g. -json_artifacts, -LLM)\n")
-		fmt.Fprintf(os.Stderr, "  +pattern       Add a custom glob pattern to scan (e.g. +*.log, +tmp-*)\n")
-		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  unslop -days 7 -min-size-mb 10\n")
-		fmt.Fprintf(os.Stderr, "  unslop -json -plan-out plan.json\n")
-		fmt.Fprintf(os.Stderr, "  unslop -include-data (Include LLM weights, agent sessions, and JSON dumps)\n")
-		fmt.Fprintf(os.Stderr, "  unslop -apply (Enable deletion mode; defaults to plan/report mode)\n")
-	}
+var osExit = os.Exit
 
-	daysFlag := flag.Float64("days", 7.0, "Minimum age in days")
-	minSizeFlag := flag.Float64("min-size-mb", 0.0, "Minimum size in MB (default: dynamic disk-scaled)")
-	manifestFlag := flag.String("manifest", "", "Custom manifest JSON path")
-	dryRunFlag := flag.Bool("dry-run", false, "Preview without deleting")
-	applyFlag := flag.Bool("apply", false, "Enable permanent deletion mode")
-	jsonFlag := flag.Bool("json", false, "Output structured JSON plan report")
-	planOutFlag := flag.String("plan-out", "", "Export JSON plan report to file path")
-	includeDataFlag := flag.Bool("include-data", false, "Include review-only data (LLM weights, agent sessions, JSON dumps)")
-	trashFlag := flag.Bool("trash", false, "Move to Trash instead of permanent deletion")
-	versionFlag := flag.Bool("version", false, "Print version and exit")
+func main() {
+	osExit(runMain(os.Args[1:], os.Stdout, os.Stderr, os.Stdin))
+}
+
+func runMain(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
+	flags := flag.NewFlagSet("unslop", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+
+	daysFlag := flags.Float64("days", 7.0, "Minimum age in days")
+	minSizeFlag := flags.Float64("min-size-mb", 0.0, "Minimum size in MB (default: dynamic disk-scaled)")
+	manifestFlag := flags.String("manifest", "", "Custom manifest JSON path")
+	dryRunFlag := flags.Bool("dry-run", false, "Preview without deleting")
+	applyFlag := flags.Bool("apply", false, "Enable permanent deletion mode")
+	jsonFlag := flags.Bool("json", false, "Output structured JSON plan report")
+	planOutFlag := flags.String("plan-out", "", "Export JSON plan report to file path")
+	includeDataFlag := flags.Bool("include-data", false, "Include review-only data (LLM weights, agent sessions, JSON dumps)")
+	trashFlag := flags.Bool("trash", false, "Move to Trash instead of permanent deletion")
+	versionFlag := flags.Bool("version", false, "Print version and exit")
 
 	var paths multimodFlag
-	flag.Var(&paths, "path", "Directory path to scan (can specify multiple)")
+	flags.Var(&paths, "path", "Directory path to scan (can specify multiple)")
 
-	flag.Parse()
+	flags.Usage = func() {
+		fmt.Fprintf(stderr, "unslop %s - Conservative developer workstation hygiene planner\n\n", Version)
+		fmt.Fprintf(stderr, "Usage:\n")
+		fmt.Fprintf(stderr, "  unslop [options] [-remove-rule ...] [+custom-pattern ...]\n\n")
+		fmt.Fprintf(stderr, "Options:\n")
+		flags.PrintDefaults()
+		fmt.Fprintf(stderr, "\nManifest Overrides (positional arguments):\n")
+		fmt.Fprintf(stderr, "  -category      Exclude a category or rule ID (e.g. -json_artifacts, -LLM)\n")
+		fmt.Fprintf(stderr, "  +pattern       Add a custom glob pattern to scan (e.g. +*.log, +tmp-*)\n")
+		fmt.Fprintf(stderr, "\nExamples:\n")
+		fmt.Fprintf(stderr, "  unslop -days 7 -min-size-mb 10\n")
+		fmt.Fprintf(stderr, "  unslop -json -plan-out plan.json\n")
+		fmt.Fprintf(stderr, "  unslop -include-data (Include LLM weights, agent sessions, and JSON dumps)\n")
+		fmt.Fprintf(stderr, "  unslop -apply (Enable deletion mode; defaults to plan/report mode)\n")
+	}
+
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
 
 	if *versionFlag {
-		fmt.Printf("unslop version %s\n", Version)
-		return
+		fmt.Fprintf(stdout, "unslop version %s\n", Version)
+		return 0
 	}
 
 	daysSet := false
 	minSizeSet := false
-	flag.Visit(func(f *flag.Flag) {
+	flags.Visit(func(f *flag.Flag) {
 		if f.Name == "days" {
 			daysSet = true
 		}
@@ -1021,12 +1033,12 @@ func main() {
 
 	manifest, err := loadManifest(*manifestFlag)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[FATAL] %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "[FATAL] %v\n", err)
+		return 1
 	}
 
 	engine := NewRuleEngine(manifest)
-	applyOverrides(engine, flag.Args())
+	applyOverrides(engine, flags.Args())
 
 	diskTotal, diskUsed, diskFree, _ := getDiskSpace("/")
 	dynamicMinSizeMB := calculateDynamicMinSizeMB(diskTotal)
@@ -1057,7 +1069,6 @@ func main() {
 		totalCandidatesSizeBytes += c.Size
 	}
 
-	// Structured JSON Plan Report mode
 	if *jsonFlag || *planOutFlag != "" {
 		report := PlanReport{
 			Version:   Version,
@@ -1078,41 +1089,41 @@ func main() {
 
 		jsonData, err := json.MarshalIndent(report, "", "  ")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error marshaling JSON plan: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "Error marshaling JSON plan: %v\n", err)
+			return 1
 		}
 
 		if *jsonFlag {
-			fmt.Println(string(jsonData))
+			fmt.Fprintln(stdout, string(jsonData))
 		}
 		if *planOutFlag != "" {
 			if err := os.WriteFile(*planOutFlag, jsonData, 0644); err != nil {
-				fmt.Fprintf(os.Stderr, "Error writing plan report to '%s': %v\n", *planOutFlag, err)
-				os.Exit(1)
+				fmt.Fprintf(stderr, "Error writing plan report to '%s': %v\n", *planOutFlag, err)
+				return 1
 			}
-			fmt.Fprintf(os.Stderr, "JSON plan exported successfully to '%s'\n", *planOutFlag)
+			fmt.Fprintf(stderr, "JSON plan exported successfully to '%s'\n", *planOutFlag)
 		}
 
 		if !*applyFlag && !*dryRunFlag {
-			return
+			return 0
 		}
 	}
 
 	fzfBin := findFzf()
 	if fzfBin == "" {
-		fmt.Fprintf(os.Stderr, "\n[PLAN REPORT] fzf runtime binary not found. Standard text summary output below:\n\n")
+		fmt.Fprintf(stderr, "\n[PLAN REPORT] fzf runtime binary not found. Standard text summary output below:\n\n")
 		for _, c := range candidates {
-			fmt.Printf(" [%-14s | %-16s] %10s | %4.1fd | %s\n", c.RiskClass, c.Category, formatBytes(c.Size), c.AgeDays, c.Path)
+			fmt.Fprintf(stdout, " [%-14s | %-16s] %10s | %4.1fd | %s\n", c.RiskClass, c.Category, formatBytes(c.Size), c.AgeDays, c.Path)
 		}
-		fmt.Printf("\nTotal candidates: %d (%s)\n", len(candidates), formatBytes(totalCandidatesSizeBytes))
-		return
+		fmt.Fprintf(stdout, "\nTotal candidates: %d (%s)\n", len(candidates), formatBytes(totalCandidatesSizeBytes))
+		return 0
 	}
 
 	selected := runFzfInteractive(candidates, fzfBin, diskTotal, diskUsed, diskFree)
 
-	// In read-only alpha mode, default to dry-run unless -apply flag is explicitly set
 	isDryRun := *dryRunFlag || !*applyFlag
-	confirmAndDelete(selected, isDryRun, *trashFlag, diskUsed, diskFree)
+	confirmAndDeleteWithIO(selected, isDryRun, *trashFlag, diskUsed, diskFree, stdout, stdin)
+	return 0
 }
 
 type multimodFlag []string
@@ -1152,8 +1163,12 @@ func moveToTrash(path string) error {
 }
 
 func confirmAndDelete(selected []Candidate, dryRun bool, useTrash bool, diskUsed, diskFree uint64) {
+	confirmAndDeleteWithIO(selected, dryRun, useTrash, diskUsed, diskFree, os.Stdout, os.Stdin)
+}
+
+func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, useTrash bool, diskUsed, diskFree uint64, stdout io.Writer, stdin io.Reader) {
 	if len(selected) == 0 {
-		fmt.Println("No items selected. Exiting.")
+		fmt.Fprintln(stdout, "No items selected. Exiting.")
 		return
 	}
 
@@ -1167,11 +1182,11 @@ func confirmAndDelete(selected []Candidate, dryRun bool, useTrash bool, diskUsed
 		newDiskUsed = 0
 	}
 
-	fmt.Printf("\n============================================================\n")
-	fmt.Printf(" STAGED FOR DELETION: %d items (%s)\n", len(selected), formatBytes(total))
-	fmt.Printf(" DISK SAVINGS: %s used -> %s used (Will free %s)\n",
+	fmt.Fprintf(stdout, "\n============================================================\n")
+	fmt.Fprintf(stdout, " STAGED FOR DELETION: %d items (%s)\n", len(selected), formatBytes(total))
+	fmt.Fprintf(stdout, " DISK SAVINGS: %s used -> %s used (Will free %s)\n",
 		formatUintBytes(diskUsed), formatBytes(newDiskUsed), formatBytes(total))
-	fmt.Printf("============================================================\n")
+	fmt.Fprintf(stdout, "============================================================\n")
 	for _, c := range selected {
 		kind := "FILE"
 		if c.IsDir {
@@ -1181,54 +1196,54 @@ func confirmAndDelete(selected []Candidate, dryRun bool, useTrash bool, diskUsed
 		if c.IsData {
 			dataTag = " [REVIEW DATA]"
 		}
-		fmt.Printf(" [%s: %-13s | RISK: %-16s] %10s | %4.1fd old | %s%s\n", kind, c.Category, c.RiskClass, formatBytes(c.Size), c.AgeDays, c.Path, dataTag)
+		fmt.Fprintf(stdout, " [%s: %-13s | RISK: %-16s] %10s | %4.1fd old | %s%s\n", kind, c.Category, c.RiskClass, formatBytes(c.Size), c.AgeDays, c.Path, dataTag)
 	}
-	fmt.Printf("============================================================\n")
+	fmt.Fprintf(stdout, "============================================================\n")
 
 	if dryRun {
-		fmt.Println("\n[READ-ONLY PLAN MODE] No files were deleted. Pass '-apply' flag to execute deletion.")
+		fmt.Fprintln(stdout, "\n[READ-ONLY PLAN MODE] No files were deleted. Pass '-apply' flag to execute deletion.")
 		return
 	}
 
-	fmt.Printf("\nAre you sure you want to permanently delete these %d items? (y/N): ", len(selected))
-	reader := bufio.NewReader(os.Stdin)
+	fmt.Fprintf(stdout, "\nAre you sure you want to permanently delete these %d items? (y/N): ", len(selected))
+	reader := bufio.NewReader(stdin)
 	ans, _ := reader.ReadString('\n')
 	if strings.ToLower(strings.TrimSpace(ans)) == "y" {
-		fmt.Println("\nDeleting/Uninstalling items...")
+		fmt.Fprintln(stdout, "\nDeleting/Uninstalling items...")
 		var freed int64
 		for _, c := range selected {
 			info, err := os.Lstat(c.Path)
 			if err != nil {
-				fmt.Printf(" [SKIP] %s no longer exists on disk.\n", c.Path)
+				fmt.Fprintf(stdout, " [SKIP] %s no longer exists on disk.\n", c.Path)
 				continue
 			}
 
 			if info.IsDir() != c.IsDir {
-				fmt.Printf(" [ABORT] File type changed for %s! Skipping.\n", c.Path)
+				fmt.Fprintf(stdout, " [ABORT] File type changed for %s! Skipping.\n", c.Path)
 				continue
 			}
 
 			if c.IsDir && containsProtectedPath(c.Path) {
-				fmt.Printf(" [PROTECTED SAFEGUARD] %s contains protected credential/config files inside. Refusing deletion!\n", c.Path)
+				fmt.Fprintf(stdout, " [PROTECTED SAFEGUARD] %s contains protected credential/config files inside. Refusing deletion!\n", c.Path)
 				continue
 			}
 
 			if len(c.UninstallArgs) > 0 {
 				execStr := strings.Join(c.UninstallArgs, " ")
-				fmt.Printf(" [UNINSTALLING: %s] Running '%s'...\n", c.Category, execStr)
+				fmt.Fprintf(stdout, " [UNINSTALLING: %s] Running '%s'...\n", c.Category, execStr)
 				cmd := exec.Command(c.UninstallArgs[0], c.UninstallArgs[1:]...)
 				out, err := cmd.CombinedOutput()
 				if err != nil {
-					fmt.Printf(" [ERROR] Native uninstall failed: %v\n%s\n", err, strings.TrimSpace(string(out)))
-					fmt.Printf(" Fallback: Remove '%s' directly? (y/N): ", c.Path)
+					fmt.Fprintf(stdout, " [ERROR] Native uninstall failed: %v\n%s\n", err, strings.TrimSpace(string(out)))
+					fmt.Fprintf(stdout, " Fallback: Remove '%s' directly? (y/N): ", c.Path)
 					ansFallback, _ := reader.ReadString('\n')
 					if strings.ToLower(strings.TrimSpace(ansFallback)) == "y" {
 						if useTrash {
 							if errTrash := moveToTrash(c.Path); errTrash == nil {
 								freed += c.Size
-								fmt.Printf(" [TRASHED] %s\n", c.Path)
+								fmt.Fprintf(stdout, " [TRASHED] %s\n", c.Path)
 							} else {
-								fmt.Printf(" [ERROR] Failed to trash: %v\n", errTrash)
+								fmt.Fprintf(stdout, " [ERROR] Failed to trash: %v\n", errTrash)
 							}
 						} else {
 							var errDel error
@@ -1239,23 +1254,23 @@ func confirmAndDelete(selected []Candidate, dryRun bool, useTrash bool, diskUsed
 							}
 							if errDel == nil {
 								freed += c.Size
-								fmt.Printf(" [DELETED BINARY] %s\n", c.Path)
+								fmt.Fprintf(stdout, " [DELETED BINARY] %s\n", c.Path)
 							} else {
-								fmt.Printf(" [ERROR] Failed to remove binary: %v\n", errDel)
+								fmt.Fprintf(stdout, " [ERROR] Failed to remove binary: %v\n", errDel)
 							}
 						}
 					}
 				} else {
 					freed += c.Size
-					fmt.Printf(" [UNINSTALLED SUCCESS] %s via '%s'\n", c.Path, execStr)
+					fmt.Fprintf(stdout, " [UNINSTALLED SUCCESS] %s via '%s'\n", c.Path, execStr)
 				}
 			} else {
 				if useTrash {
 					if errTrash := moveToTrash(c.Path); errTrash == nil {
 						freed += c.Size
-						fmt.Printf(" [TRASHED] %s\n", c.Path)
+						fmt.Fprintf(stdout, " [TRASHED] %s\n", c.Path)
 					} else {
-						fmt.Printf(" [ERROR] Failed to trash %s: %v\n", c.Path, errTrash)
+						fmt.Fprintf(stdout, " [ERROR] Failed to trash %s: %v\n", c.Path, errTrash)
 					}
 				} else {
 					var errDel error
@@ -1265,16 +1280,16 @@ func confirmAndDelete(selected []Candidate, dryRun bool, useTrash bool, diskUsed
 						errDel = os.Remove(c.Path)
 					}
 					if errDel != nil {
-						fmt.Printf(" [ERROR] Failed to delete %s: %v\n", c.Path, errDel)
+						fmt.Fprintf(stdout, " [ERROR] Failed to delete %s: %v\n", c.Path, errDel)
 					} else {
 						freed += c.Size
-						fmt.Printf(" [DELETED] %s\n", c.Path)
+						fmt.Fprintf(stdout, " [DELETED] %s\n", c.Path)
 					}
 				}
 			}
 		}
-		fmt.Printf("\nSuccessfully freed %s of disk space!\n", formatBytes(freed))
+		fmt.Fprintf(stdout, "\nSuccessfully freed %s of disk space!\n", formatBytes(freed))
 	} else {
-		fmt.Println("\nOperation cancelled. No files were deleted.")
+		fmt.Fprintln(stdout, "\nOperation cancelled. No files were deleted.")
 	}
 }
