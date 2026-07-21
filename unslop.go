@@ -1222,6 +1222,9 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 	now := time.Now()
 	startTime := now
 
+	var completedRoots int64
+	totalRoots := int64(len(topLevelPaths))
+
 	doneProgress := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
@@ -1229,12 +1232,18 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 		for {
 			select {
 			case <-doneProgress:
-				fmt.Fprintf(os.Stderr, "\r\033[K")
+				sFiles := atomic.LoadInt64(&scannedFiles)
+				cBytes := atomic.LoadInt64(&candidateBytes)
+				cCount := atomic.LoadInt64(&candidateCount)
+				bar := renderProgressBar(100.0, 20)
+				fmt.Fprintf(os.Stderr, "\r\033[KScanning %s 100%% | %s files | Candidates: %d (%s)\n",
+					bar, formatNumber(sFiles), cCount, formatBytes(cBytes))
 				return
 			case <-ticker.C:
 				sFiles := atomic.LoadInt64(&scannedFiles)
 				cBytes := atomic.LoadInt64(&candidateBytes)
 				cCount := atomic.LoadInt64(&candidateCount)
+				cRoots := atomic.LoadInt64(&completedRoots)
 
 				elapsedSec := time.Since(startTime).Seconds()
 				filesPerSec := 0.0
@@ -1242,8 +1251,14 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 					filesPerSec = float64(sFiles) / elapsedSec
 				}
 
-				fmt.Fprintf(os.Stderr, "\r\033[KScanning... %s files (%.0f/s) | Candidates: %d (%s)",
-					formatNumber(sFiles), filesPerSec, cCount, formatBytes(cBytes))
+				pct := 0.0
+				if totalRoots > 0 {
+					pct = (float64(cRoots) / float64(totalRoots)) * 100.0
+				}
+				bar := renderProgressBar(pct, 20)
+
+				fmt.Fprintf(os.Stderr, "\r\033[KScanning %s %3.0f%% | %s files (%.0f/s) | Candidates: %d (%s)",
+					bar, pct, formatNumber(sFiles), filesPerSec, cCount, formatBytes(cBytes))
 			}
 		}
 	}()
@@ -1254,6 +1269,7 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 		walkWg.Add(1)
 		go func(r string) {
 			defer walkWg.Done()
+			defer atomic.AddInt64(&completedRoots, 1)
 			sem <- struct{}{}
 			defer func() { <-sem }()
 

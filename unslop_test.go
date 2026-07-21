@@ -645,15 +645,15 @@ func TestMockFzfInteractive(t *testing.T) {
 	var script string
 	if runtime.GOOS == "windows" {
 		fzfPath += ".bat"
-		script = "@echo off\nset /p line=\necho %line%\n"
+		script = "@echo off\nmore\n"
 	} else {
-		script = "#!/bin/sh\nread line\necho \"$line\"\n"
+		script = "#!/bin/sh\ncat\n"
 	}
 	if err := os.WriteFile(fzfPath, []byte(script), 0755); err != nil {
 		t.Fatalf("Failed to write mock fzf: %v", err)
 	}
 
-	t.Setenv("PATH", binDir)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	fzfBin := findFzf()
 	if fzfBin == "" {
 		t.Fatalf("findFzf failed to locate mock fzf")
