@@ -1,7 +1,7 @@
 # unslop
 
-> **What**: `unslop` is an interactive TUI tool that discovers and cleans stale build caches, AI agent logs, unused toolchain packages, and LLM weights across your system.
-> **Why**: Use it to safely reclaim tens of gigabytes of disk space wasted by developer tools and local AI workflows without risking system file corruption or breaking active projects.
+> **What**: `unslop` is a high-performance interactive TUI tool that discovers and cleans stale build caches, AI agent logs, unused toolchain packages, and LLM weights across your system.
+> **Why**: Use it to safely reclaim gigabytes of disk space wasted by developer build tools and local AI workflows with multi-layered path safeguards, structured package manager uninstallation, and pre-deletion path re-validation.
 
 ---
 
@@ -17,87 +17,57 @@ go install github.com/yahn/unslop@latest
 
 ## Features
 
-- **Full-Width TUI with Live Inspection**: Select items using `SPACE` or `TAB` with a compact bottom preview window displaying file metadata and line previews.
-- **Declarative Rule Engine**: Configured via a simple JSON manifest to scan build caches (`.zig-cache`, `target/`), LLM weights (`.gguf`, `.safetensors`), AI agent sessions (`Codex`, `Claude`, `Gemini`, `Cursor`), and unused package binaries.
-- **Native Uninstallation**: Automatically delegates removal of unused packages to native toolchains (`cargo uninstall`, `npm uninstall -g`, `pipx uninstall`, `swiftly uninstall`, etc.).
-- **Live System Stats & Exact Progress**: Displays real-time disk usage, exact file progress percentage, scanning throughput (`files/s`), and accumulated candidate space in GB.
-- **Safeguards**: Protected path rules ensure credentials, active project configurations, and agent memories are never touched.
+- **Full-Width TUI with Live Inspection**: Select items using `SPACE` or `TAB` with a bottom preview window displaying line previews and item metadata.
+- **Fail-Closed Declarative Engine**: Configured via JSON rule manifests to scan build caches (`.zig-cache`, `target/`), LLM weights (`.gguf`, `.safetensors`), AI agent sessions (`Codex`, `Claude`, `Gemini`, `Cursor`), and verified unused package binaries.
+- **Structured Toolchain Uninstallation**: Maps installed package inventories (`~/.cargo/.crates.toml`, `pipx`, `npm`, `swiftly`, `sdkman`, `dotnet`, `composer`) and executes uninstallation via direct argument arrays without shell expansion (`sh -c`).
+- **Data vs Cache Categorization**: Default scans focus on safe, regenerable build caches (`.zig-cache`, `target/`, `.gradle`, `node_modules/.cache`). User data and model weights require explicit `--include-data` review opt-in.
+- **Multi-Layered Safeguards**:
+  - **Subtree Protection Guard**: Verifies candidate subtrees before removal to prevent deleting protected configuration, credentials, or agent memory files.
+  - **Pre-Deletion Path Re-Validation**: Verifies file modification times, file size, and item types directly before execution to prevent operating on stale scan snapshots.
+  - **System Trash Support**: Optional `--trash` flag moves items to system trash instead of permanent deletion.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Run unslop interactively
+# Run unslop interactively (scans safe regenerable build caches)
 unslop
 
-# Custom age window (e.g. 7 days) and minimum size (e.g. 10 MB)
-unslop -days 7 -min-size-mb 10
+# Include user data, AI agent sessions, and LLM weights for review
+unslop -include-data
 
-# Scan specific directories in preview mode
+# Move candidates to Trash instead of permanently deleting
+unslop -trash
+
+# Custom age window (e.g. 14 days) and minimum size (e.g. 10 MB)
+unslop -days 14 -min-size-mb 10
+
+# Scan specific directories in dry-run mode
 unslop -path ~/.cache -path /tmp -dry-run
-
-# Exclude specific rules or add custom patterns
-unslop -json_artifacts +*.bak
 ```
 
 ---
 
-## Configuration & Custom Manifest Hierarchy
+## Configuration & Manifest Hierarchy
 
-`unslop` resolves configuration automatically using the following order of precedence:
+`unslop` resolves manifest rules in the following strict order of precedence:
 
-1. **Explicit CLI Flag**: `-manifest /path/to/custom.json`
-2. **User Home Override**: `~/.unslop.json` (Easily override rules from your home folder)
+1. **Explicit CLI Flag**: `-manifest /path/to/custom.json` (Fails closed immediately if invalid or missing)
+2. **User Home Override**: `~/.unslop.json`
 3. **XDG Config Directory**: `~/.config/unslop/manifest.json` (or `$XDG_CONFIG_HOME`)
-4. **Embedded Default Binary Manifest**: Embedded at compile time via `//go:embed` (Auto-creates `~/.config/unslop/manifest.json` on first run if no config exists).
-
-### Example Custom Manifest (`~/.unslop.json`)
-
-```json
-{
-  "rules": [
-    {
-      "id": "llm_weights",
-      "name": "Local LLM Models",
-      "target": "file",
-      "patterns": ["*.gguf", "*.safetensors", "*.ckpt"],
-      "category": "LLM Model",
-      "min_size_mb": 100.0
-    },
-    {
-      "id": "swift_toolchain",
-      "name": "Swift Toolchains",
-      "target": "dir",
-      "patterns": ["*/.local/share/swiftly/toolchains/*"],
-      "category": "UNUSED (Swift)",
-      "uninstall_cmd": "swiftly uninstall {name}"
-    },
-    {
-      "id": "custom_cache",
-      "name": "Custom Project Cache",
-      "target": "dir",
-      "patterns": [".my-cache", "tmp-build-*"],
-      "category": "Custom Cache"
-    }
-  ]
-}
-```
+4. **Embedded Default Manifest**: Embedded at compile time via `//go:embed`.
 
 ---
 
-## Other Options & Comparison
+## Comparison
 
-While general-purpose disk analyzers and language cleanup tools exist, `unslop` is built specifically for modern AI-assisted developer environments.
-
-### Feature Comparison Matrix
-
-| Tool | Ease of Extensibility | TUI Interactivity & Inspection | Full Developer & AI Agent Scope | Native Toolchain Uninstallation |
+| Tool | Declarative Custom Rules | Structured Toolchain Uninstallation | Subtree Safeguards & Re-Validation | Review-Only Data Opt-In |
 | :--- | :--- | :--- | :--- | :--- |
-| **`unslop`** | **Declarative JSON rules** (Add any path, file pattern, or command without coding) | **Full-width line list** + live multi-line preview pane | **Covers build caches, temp dirs, AI Agent logs/sessions, LLM weights, & unused language binaries** | **Yes** (Delegates to `cargo`, `npm`, `pipx`, `swiftly`, `sdk`, `composer`, etc.) |
-| **[Kondo](https://github.com/tbillington/kondo)** | Fixed rust codebase (Requires PRs/recompilation for new ecosystems) | Single-line list picker | Project build directories (`target`, `node_modules`, `venv`) | No (Direct directory removal only) |
-| **[dua-cli](https://github.com/Byron/dua-cli)** | None (Strict file tree analyzer) | Interactive directory tree navigator | General disk usage across all files | No |
-| **[ncdu](https://dev.lollogobaldo.com/ncdu/)** | None (Ncurses disk usage viewer) | Interactive directory tree navigator | General disk usage across all files | No |
+| **`unslop`** | **Yes** (JSON manifest) | **Yes** (cargo, npm, pipx, swiftly, sdkman, dotnet, composer) | **Yes** (Subtree guard + `lstat` snapshot recheck) | **Yes** (`--include-data`) |
+| **[Kondo](https://github.com/tbillington/kondo)** | No | No (Direct directory removal) | No | No |
+| **[dua-cli](https://github.com/Byron/dua-cli)** | No | No | No | No |
+| **[ncdu](https://dev.lollogobaldo.com/ncdu/)** | No | No | No | No |
 
 ---
 

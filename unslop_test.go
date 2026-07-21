@@ -40,31 +40,26 @@ func TestFormatUintBytes(t *testing.T) {
 func TestCalculateDynamicMinSizeMB(t *testing.T) {
 	const gb = uint64(1024 * 1024 * 1024)
 
-	// 10 GB -> 1.0 MB
 	sz10 := calculateDynamicMinSizeMB(10 * gb)
 	if sz10 != 1.0 {
 		t.Errorf("10GB disk should yield 1.0 MB; got %.2f", sz10)
 	}
 
-	// 50 GB -> 1.0 MB
 	sz50 := calculateDynamicMinSizeMB(50 * gb)
 	if sz50 != 1.0 {
 		t.Errorf("50GB disk should yield 1.0 MB; got %.2f", sz50)
 	}
 
-	// 100 GB -> 10.0 MB
 	sz100 := calculateDynamicMinSizeMB(100 * gb)
 	if sz100 < 9.9 || sz100 > 10.1 {
 		t.Errorf("100GB disk should yield ~10.0 MB; got %.2f", sz100)
 	}
 
-	// 1000 GB (1TB) -> 50.0 MB
 	sz1000 := calculateDynamicMinSizeMB(1000 * gb)
 	if sz1000 != 50.0 {
 		t.Errorf("1TB disk should yield 50.0 MB cap; got %.2f", sz1000)
 	}
 
-	// Zero disk size -> fallback
 	szZero := calculateDynamicMinSizeMB(0)
 	if szZero != 10.0 {
 		t.Errorf("0 disk size should yield 10.0 MB fallback; got %.2f", szZero)
@@ -82,28 +77,43 @@ func TestFormatNumber(t *testing.T) {
 
 func TestIsProtected(t *testing.T) {
 	if !isProtected("/path/to/config.toml") {
-		t.Errorf("config.toml should be protected")
+		t.Errorf("isProtected config.toml failed")
 	}
-	if !isProtected("/path/to/settings.json") {
-		t.Errorf("settings.json should be protected")
+	if !isProtected("/path/to/credentials.json") {
+		t.Errorf("isProtected credentials.json failed")
 	}
-	if !isProtected("/path/to/rules") {
-		t.Errorf("rules should be protected")
+	if isProtected("/path/to/normal.txt") {
+		t.Errorf("isProtected normal.txt failed")
 	}
-	if isProtected("/path/to/random.txt") {
-		t.Errorf("random.txt should not be protected")
+}
+
+func TestContainsProtectedPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	subDir := filepath.Join(tmpDir, "sub")
+	os.MkdirAll(subDir, 0755)
+	credFile := filepath.Join(subDir, "credentials.json")
+	os.WriteFile(credFile, []byte("secret"), 0600)
+
+	if !containsProtectedPath(tmpDir) {
+		t.Errorf("containsProtectedPath should detect sub/credentials.json")
+	}
+
+	safeDir := t.TempDir()
+	os.WriteFile(filepath.Join(safeDir, "foo.txt"), []byte("ok"), 0644)
+	if containsProtectedPath(safeDir) {
+		t.Errorf("containsProtectedPath reported true for clean directory")
 	}
 }
 
 func TestMatchPattern(t *testing.T) {
-	if !matchPattern("file.json", "*.json") {
-		t.Errorf("file.json should match *.json")
+	if !matchPattern("model.gguf", "*.gguf") {
+		t.Errorf("matchPattern model.gguf failed")
 	}
-	if !matchPattern("test-dir", "test*") {
-		t.Errorf("test-dir should match test*")
+	if !matchPattern("build.o", "build.*") {
+		t.Errorf("matchPattern build.o failed")
 	}
-	if !matchPattern("/path/to/target/build", "target") {
-		t.Errorf("path should match substring target")
+	if matchPattern("model.txt", "*.gguf") {
+		t.Errorf("matchPattern model.txt incorrectly matched *.gguf")
 	}
 }
 
@@ -112,34 +122,25 @@ func TestRenderProgressBar(t *testing.T) {
 	if bar0 != "[░░░░░░░░░░]" {
 		t.Errorf("renderProgressBar(0) = %s", bar0)
 	}
+
 	bar50 := renderProgressBar(50, 10)
 	if bar50 != "[█████░░░░░]" {
 		t.Errorf("renderProgressBar(50) = %s", bar50)
 	}
+
 	bar100 := renderProgressBar(100, 10)
 	if bar100 != "[██████████]" {
 		t.Errorf("renderProgressBar(100) = %s", bar100)
 	}
 }
 
-func TestFormatUninstallCmd(t *testing.T) {
-	cmd1 := formatUninstallCmd("cargo uninstall {name}", "my-pkg", "/path/to/my-pkg")
-	if cmd1 != "cargo uninstall my-pkg" {
-		t.Errorf("formatUninstallCmd cargo failed: %s", cmd1)
-	}
-
-	cmd2 := formatUninstallCmd("sdk uninstall {candidate} {version}", "v1.0", "/path/to/.sdkman/candidates/java/v1.0")
-	if cmd2 != "sdk uninstall java v1.0" {
-		t.Errorf("formatUninstallCmd sdkman failed: %s", cmd2)
-	}
-}
-
 func TestRuleEngineMatching(t *testing.T) {
 	m := getDefaultManifest()
 	engine := NewRuleEngine(m)
+	inv := loadPackageInventory()
 
 	// Test MatchDir
-	ruleDir, name, _ := engine.MatchDir(".zig-cache", "/path/to/.zig-cache")
+	ruleDir, name, _ := engine.MatchDir(".zig-cache", "/path/to/.zig-cache", inv)
 	if ruleDir == nil || ruleDir.Category != "Cache Dir" {
 		t.Errorf("MatchDir .zig-cache failed")
 	}
@@ -152,7 +153,7 @@ func TestRuleEngineMatching(t *testing.T) {
 	os.WriteFile(tmpFile, []byte("data"), 0644)
 	fi, _ := os.Stat(tmpFile)
 
-	ruleFile, _, _ := engine.MatchFile("model.gguf", tmpFile, fi)
+	ruleFile, _, _ := engine.MatchFile("model.gguf", tmpFile, fi, inv)
 	if ruleFile == nil || ruleFile.Category != "LLM Model" {
 		t.Errorf("MatchFile model.gguf failed")
 	}
@@ -161,6 +162,7 @@ func TestRuleEngineMatching(t *testing.T) {
 func TestApplyOverrides(t *testing.T) {
 	m := getDefaultManifest()
 	engine := NewRuleEngine(m)
+	inv := loadPackageInventory()
 
 	removed, added := applyOverrides(engine, []string{"-zig_cache", "+*.bak"})
 	if len(removed) != 1 || removed[0] != "zig_cache" {
@@ -170,8 +172,7 @@ func TestApplyOverrides(t *testing.T) {
 		t.Errorf("applyOverrides add failed")
 	}
 
-	// Check if zig_cache rule was removed
-	ruleDir, _, _ := engine.MatchDir(".zig-cache", "/path/to/.zig-cache")
+	ruleDir, _, _ := engine.MatchDir(".zig-cache", "/path/to/.zig-cache", inv)
 	if ruleDir != nil {
 		t.Errorf("zig_cache rule should have been removed")
 	}
@@ -187,15 +188,15 @@ func TestLoadManifest(t *testing.T) {
 	}`
 	os.WriteFile(manPath, []byte(content), 0644)
 
-	m := loadManifest(manPath)
-	if len(m.Rules) != 1 || m.Rules[0].ID != "test_rule" {
-		t.Errorf("loadManifest custom file failed")
+	m, err := loadManifest(manPath)
+	if err != nil || len(m.Rules) != 1 || m.Rules[0].ID != "test_rule" {
+		t.Errorf("loadManifest custom file failed: %v", err)
 	}
 
-	// Test default fallback for non-existent path
-	mDefault := loadManifest("/non/existent/path.json")
-	if len(mDefault.Rules) == 0 {
-		t.Errorf("loadManifest fallback failed")
+	// Test fail-closed for non-existent path
+	_, errBad := loadManifest("/non/existent/path.json")
+	if errBad == nil {
+		t.Errorf("loadManifest for bad path should return error")
 	}
 
 	// Test ~/.unslop.json resolution
@@ -204,9 +205,9 @@ func TestLoadManifest(t *testing.T) {
 	os.WriteFile(dotPath, []byte(content), 0644)
 	t.Setenv("HOME", tempHome)
 
-	mDot := loadManifest("")
-	if len(mDot.Rules) != 1 || mDot.Rules[0].ID != "test_rule" {
-		t.Errorf("loadManifest ~/.unslop.json failed")
+	mDot, errDot := loadManifest("")
+	if errDot != nil || len(mDot.Rules) != 1 || mDot.Rules[0].ID != "test_rule" {
+		t.Errorf("loadManifest ~/.unslop.json failed: %v", errDot)
 	}
 }
 
@@ -249,12 +250,7 @@ func TestPrecountAndScanParallel(t *testing.T) {
 	subDir := filepath.Join(tmpDir, "project")
 	os.MkdirAll(subDir, 0755)
 
-	oldTime := time.Now().Add(-100 * time.Hour)
-
-	// Old stale JSON dump file (>5MB to trigger json_artifacts min_size)
-	staleFile := filepath.Join(subDir, "dump.json")
-	os.WriteFile(staleFile, bytes.Repeat([]byte("x"), 6*1024*1024), 0644)
-	os.Chtimes(staleFile, oldTime, oldTime)
+	oldTime := time.Now().Add(-200 * time.Hour)
 
 	// Old cache dir (>1MB total size)
 	cacheDir := filepath.Join(subDir, ".zig-cache")
@@ -265,52 +261,49 @@ func TestPrecountAndScanParallel(t *testing.T) {
 	os.Chtimes(cacheFile, oldTime, oldTime)
 
 	count := precountFiles([]string{tmpDir})
-	if count < 2 {
-		t.Errorf("precountFiles = %d; expected >= 2", count)
+	if count < 1 {
+		t.Errorf("precountFiles = %d; expected >= 1", count)
 	}
 
 	engine := NewRuleEngine(getDefaultManifest())
-	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 1*1024*1024)
+	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 1*1024*1024, false)
 
-	if len(candidates) < 2 {
-		t.Errorf("scanParallel found %d candidates; expected >= 2", len(candidates))
+	if len(candidates) < 1 {
+		t.Errorf("scanParallel found %d candidates; expected >= 1", len(candidates))
 	}
 }
 
 func TestConfirmAndDeleteExecution(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// 1. Empty selection test
-	confirmAndDelete(nil, false, 1000, 1000)
+	confirmAndDelete(nil, false, false, 1000, 1000)
 
-	// 2. Dry run test
 	file1 := filepath.Join(tmpDir, "file1.log")
 	os.WriteFile(file1, []byte("log data"), 0644)
-	selected1 := []Candidate{{Path: file1, Size: 8, AgeDays: 5.0, Category: "Log", IsDir: false}}
-	confirmAndDelete(selected1, true, 1000, 1000)
+	selected1 := []Candidate{{Path: file1, Size: 8, AgeDays: 5.0, Category: "Log", IsDir: false, ModTime: time.Now()}}
+	confirmAndDelete(selected1, true, false, 1000, 1000)
 	if _, err := os.Stat(file1); os.IsNotExist(err) {
 		t.Errorf("Dry run should not delete file1")
 	}
 
-	// 3. User confirmation 'y' deletion test
 	file2 := filepath.Join(tmpDir, "file2.log")
 	dir2 := filepath.Join(tmpDir, "dir2_cache")
 	os.WriteFile(file2, []byte("log data"), 0644)
 	os.MkdirAll(dir2, 0755)
+	now := time.Now()
 
 	selected2 := []Candidate{
-		{Path: file2, Size: 8, AgeDays: 5.0, Category: "Log", IsDir: false},
-		{Path: dir2, Size: 16, AgeDays: 5.0, Category: "Cache Dir", IsDir: true},
+		{Path: file2, Size: 8, AgeDays: 5.0, Category: "Log", IsDir: false, ModTime: now},
+		{Path: dir2, Size: 16, AgeDays: 5.0, Category: "Cache Dir", IsDir: true, ModTime: now},
 	}
 
-	// Mock stdin with 'y\n'
 	oldStdin := os.Stdin
 	r, w, _ := os.Pipe()
 	w.WriteString("y\n")
 	w.Close()
 	os.Stdin = r
 
-	confirmAndDelete(selected2, false, 1000, 1000)
+	confirmAndDelete(selected2, false, false, 1000, 1000)
 
 	os.Stdin = oldStdin
 
@@ -327,16 +320,15 @@ func TestConfirmAndDeleteCancellation(t *testing.T) {
 	file1 := filepath.Join(tmpDir, "keep.log")
 	os.WriteFile(file1, []byte("data"), 0644)
 
-	selected := []Candidate{{Path: file1, Size: 4, AgeDays: 5.0, Category: "Log", IsDir: false}}
+	selected := []Candidate{{Path: file1, Size: 4, AgeDays: 5.0, Category: "Log", IsDir: false, ModTime: time.Now()}}
 
-	// Mock stdin with 'n\n'
 	oldStdin := os.Stdin
 	r, w, _ := os.Pipe()
 	w.WriteString("n\n")
 	w.Close()
 	os.Stdin = r
 
-	confirmAndDelete(selected, false, 1000, 1000)
+	confirmAndDelete(selected, false, false, 1000, 1000)
 
 	os.Stdin = oldStdin
 
@@ -352,24 +344,24 @@ func TestUninstallCmdExecution(t *testing.T) {
 
 	selected := []Candidate{
 		{
-			Path:         binaryFile,
-			Size:         3,
-			AgeDays:      10.0,
-			Category:     "UNUSED (Cargo)",
-			IsDir:        false,
-			PackageName:  "dummy_bin",
-			UninstallCmd: "non_existent_command_12345",
+			Path:          binaryFile,
+			Size:          3,
+			AgeDays:       10.0,
+			Category:      "UNUSED (Cargo)",
+			IsDir:         false,
+			PackageName:   "dummy_bin",
+			UninstallArgs: []string{"non_existent_command_12345"},
+			ModTime:       time.Now(),
 		},
 	}
 
-	// Mock stdin with 'y\ny\n' for initial deletion prompt and fallback prompt
 	oldStdin := os.Stdin
 	r, w, _ := os.Pipe()
 	w.WriteString("y\ny\n")
 	w.Close()
 	os.Stdin = r
 
-	confirmAndDelete(selected, false, 1000, 1000)
+	confirmAndDelete(selected, false, false, 1000, 1000)
 
 	os.Stdin = oldStdin
 
@@ -379,7 +371,7 @@ func TestUninstallCmdExecution(t *testing.T) {
 }
 
 func TestRunFzfInteractiveEmpty(t *testing.T) {
-	res := runFzfInteractive(nil, "fzf", 100, 50, 50)
+	res := runFzfInteractive(nil, "fzf", 1000, 500, 500)
 	if res != nil {
 		t.Errorf("runFzfInteractive with empty candidates should return nil")
 	}
