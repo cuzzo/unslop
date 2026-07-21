@@ -235,7 +235,7 @@ func TestUninstallPackageEmptyArgsRefused(t *testing.T) {
 	if res.Skipped != 1 || res.Completed != 0 {
 		t.Errorf("Expected skipped action for package-managed candidate; got skipped=%d, completed=%d", res.Skipped, res.Completed)
 	}
-	if !strings.Contains(stdout.String(), "Action refused") && !strings.Contains(stdout.String(), "report-only") {
+	if !strings.Contains(strings.ToLower(stdout.String()), "action refused") && !strings.Contains(strings.ToLower(stdout.String()), "report-only") {
 		t.Errorf("Expected Action refused print; got:\n%s", stdout.String())
 	}
 }

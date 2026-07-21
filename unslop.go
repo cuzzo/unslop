@@ -601,7 +601,7 @@ var protectedAgentPaths = []string{
 func isProtected(path string) bool {
 	base := strings.ToLower(filepath.Base(path))
 	for _, p := range protectedAgentPaths {
-		if base == p || strings.Contains(base, p) {
+		if base == p {
 			return true
 		}
 	}
@@ -2218,39 +2218,67 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 		return res
 	}
 
-	var total int64
+	var actionable []Candidate
+	var reportOnly []Candidate
 	for _, c := range selected {
-		total += c.Size
+		if c.CanDelete && c.ProposedAction != "report-only" {
+			actionable = append(actionable, c)
+		} else {
+			reportOnly = append(reportOnly, c)
+		}
 	}
 
-	newDiskUsed := int64(diskUsed) - total
+	var totalActionable int64
+	for _, c := range actionable {
+		totalActionable += c.Size
+	}
+
+	newDiskUsed := int64(diskUsed) - totalActionable
 	if newDiskUsed < 0 {
 		newDiskUsed = 0
 	}
 
-	fmt.Fprintf(stdout, "\n============================================================\n")
-	fmt.Fprintf(stdout, " STAGED FOR REVIEW: %d items (%s)\n", len(selected), formatBytes(total))
-	if useTrash {
-		fmt.Fprintf(stdout, " DISK SAVINGS: Move to Trash (%s staged; use -force-permanent to reclaim space)\n", formatBytes(total))
-	} else {
-		fmt.Fprintf(stdout, " DISK SAVINGS: %s used -> %s used (Will free %s)\n",
-			formatUintBytes(diskUsed), formatBytes(newDiskUsed), formatBytes(total))
-	}
-	fmt.Fprintf(stdout, "============================================================\n")
-	for _, c := range selected {
-		kind := "FILE"
-		if c.IsDir {
-			kind = "DIR "
+	if len(actionable) > 0 {
+		fmt.Fprintf(stdout, "\n============================================================\n")
+		fmt.Fprintf(stdout, " STAGED FOR REVIEW: %d items (%s)\n", len(actionable), formatBytes(totalActionable))
+		if useTrash {
+			fmt.Fprintf(stdout, " DISK SAVINGS: Move to Trash (%s staged; use -force-permanent to reclaim space)\n", formatBytes(totalActionable))
+		} else {
+			fmt.Fprintf(stdout, " DISK SAVINGS: %s used -> %s used (Will free %s)\n",
+				formatUintBytes(diskUsed), formatBytes(newDiskUsed), formatBytes(totalActionable))
 		}
-		statusTag := ""
-		if !c.CanDelete || c.RiskClass == RiskUnknown {
-			statusTag = " [REPORT-ONLY]"
-		} else if c.RiskClass == RiskUserData {
-			statusTag = " [REQUIRES -apply-data]"
+		fmt.Fprintf(stdout, "============================================================\n")
+		for _, c := range actionable {
+			kind := "FILE"
+			if c.IsDir {
+				kind = "DIR "
+			}
+			statusTag := ""
+			if c.RiskClass == RiskUserData {
+				statusTag = " [REQUIRES -apply-data]"
+			}
+			fmt.Fprintf(stdout, " [%s: %-13s | RISK: %-16s] %10s | %4.1fd old | %s%s\n", kind, c.Category, c.RiskClass, formatBytes(c.Size), c.AgeDays, c.Path, statusTag)
 		}
-		fmt.Fprintf(stdout, " [%s: %-13s | RISK: %-16s] %10s | %4.1fd old | %s%s\n", kind, c.Category, c.RiskClass, formatBytes(c.Size), c.AgeDays, c.Path, statusTag)
+		fmt.Fprintf(stdout, "============================================================\n")
 	}
-	fmt.Fprintf(stdout, "============================================================\n")
+
+	if len(reportOnly) > 0 {
+		var totalReportOnly int64
+		for _, c := range reportOnly {
+			totalReportOnly += c.Size
+		}
+		fmt.Fprintf(stdout, "\n============================================================\n")
+		fmt.Fprintf(stdout, " REPORT-ONLY / INFORMATIONAL (No Deletion Staged): %d items (%s)\n", len(reportOnly), formatBytes(totalReportOnly))
+		fmt.Fprintf(stdout, "============================================================\n")
+		for _, c := range reportOnly {
+			kind := "FILE"
+			if c.IsDir {
+				kind = "DIR "
+			}
+			fmt.Fprintf(stdout, " [%s: %-13s | RISK: %-16s] %10s | %4.1fd old | %s [REPORT-ONLY]\n", kind, c.Category, c.RiskClass, formatBytes(c.Size), c.AgeDays, c.Path)
+		}
+		fmt.Fprintf(stdout, "============================================================\n")
+	}
 
 	if dryRun {
 		fmt.Fprintln(stdout, "\n[READ-ONLY PLAN MODE] No files were deleted. Pass '-apply' flag to execute deletion.")
@@ -2258,7 +2286,13 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 		return res
 	}
 
-	fmt.Fprintf(stdout, "\nAre you sure you want to proceed with permanent action on these %d items? (y/N): ", len(selected))
+	if len(actionable) == 0 {
+		fmt.Fprintln(stdout, "\nNo actionable items eligible for deletion. Exiting.")
+		res.Skipped = len(selected)
+		return res
+	}
+
+	fmt.Fprintf(stdout, "\nAre you sure you want to proceed with permanent action on these %d items? (y/N): ", len(actionable))
 	reader := bufio.NewReader(stdin)
 	ans, _ := reader.ReadString('\n')
 	if strings.ToLower(strings.TrimSpace(ans)) != "y" {
@@ -2269,7 +2303,9 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 
 	fmt.Fprintln(stdout, "\nExecuting actions...")
 
-	for _, c := range selected {
+	res.Skipped += len(reportOnly)
+
+	for _, c := range actionable {
 		info, err := os.Lstat(c.Path)
 		if err != nil {
 			fmt.Fprintf(stdout, " [SKIP] %s no longer exists on disk.\n", c.Path)

@@ -294,8 +294,8 @@ func TestCustomUserPatternsAreUnknownReportOnly(t *testing.T) {
 	var stdout bytes.Buffer
 	confirmAndDeleteWithIO(candidates, false, false, false, 1000, 1000, &stdout, stdin)
 
-	if !strings.Contains(stdout.String(), "[SKIP REPORT-ONLY]") {
-		t.Errorf("Expected [SKIP REPORT-ONLY] in output; got:\n%s", stdout.String())
+	if !strings.Contains(strings.ToLower(stdout.String()), "report-only") {
+		t.Errorf("Expected REPORT-ONLY in output; got:\n%s", stdout.String())
 	}
 
 	// Verify invariant: custom pattern file MUST STILL EXIST
@@ -1603,7 +1603,7 @@ func TestPolicyDeterminedByRiskClassNotCategory(t *testing.T) {
 	// Confirm that confirmAndDeleteWithIO refuses deletion
 	var stdout bytes.Buffer
 	confirmAndDeleteWithIO([]Candidate{c}, false, true, false, 100, 100, &stdout, strings.NewReader("y\n"))
-	if !strings.Contains(stdout.String(), "Action refused") && !strings.Contains(stdout.String(), "report-only") {
+	if !strings.Contains(strings.ToLower(stdout.String()), "action refused") && !strings.Contains(strings.ToLower(stdout.String()), "report-only") {
 		t.Errorf("Expected confirmAndDeleteWithIO to refuse action on package-managed report-only candidate; got:\n%s", stdout.String())
 	}
 }
