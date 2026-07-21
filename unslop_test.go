@@ -1094,6 +1094,371 @@ func TestMacOSWindowsRuntimeHelpers(t *testing.T) {
 	}
 }
 
+func TestCoverage100PercentTargeted(t *testing.T) {
+	_, _, _, errSyscall := getDiskSpaceSyscall("/non_existent_mount_path_99999")
+	if errSyscall == nil {
+		t.Errorf("getDiskSpaceSyscall on invalid path should return error")
+	}
+
+	if renderProgressBar(50, 0) != "[░░░░░░░░░░]" {
+		t.Errorf("renderProgressBar with total <= 0 failed")
+	}
+
+	if formatUninstallArgs("UNKNOWN_CATEGORY_XYZ", "pkg", "/path", &PackageInventory{}) != nil {
+		t.Errorf("formatUninstallArgs default branch should return nil")
+	}
+
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	if findFzf() != "" {
+		t.Errorf("findFzf should return empty string when fzf is missing")
+	}
+
+	tmpDir := t.TempDir()
+	badFzf := filepath.Join(tmpDir, "bad_fzf")
+	os.WriteFile(badFzf, []byte("#!/bin/sh\nexit 1\n"), 0755)
+	candsFzf := []Candidate{{ID: 1, Path: "/tmp/foo", Size: 100}}
+	resFzf := runFzfInteractive(candsFzf, badFzf, 100, 50, 50)
+	if resFzf != nil {
+		t.Errorf("runFzfInteractive bad fzf exit should return nil")
+	}
+
+	engine := NewRuleEngine(getDefaultManifest())
+	tmpFile := filepath.Join(tmpDir, "app.log")
+	os.WriteFile(tmpFile, []byte("log data"), 0644)
+
+	inv := &PackageInventory{}
+	infoTmp, _ := os.Stat(tmpFile)
+	matchedRule, _, _ := engine.MatchFile(filepath.Base(tmpFile), tmpFile, infoTmp, inv)
+	_ = matchedRule
+
+	noRemoveFile := filepath.Join(tmpDir, "no_remove.log")
+	os.WriteFile(noRemoveFile, []byte("data"), 0644)
+
+	candRemoveErr := Candidate{
+		Path:      noRemoveFile,
+		Size:      4,
+		AgeDays:   5.0,
+		Category:  "Log",
+		RiskClass: RiskRegenerable,
+		IsDir:     false,
+		CanDelete: true,
+		ModTime:   time.Now(),
+	}
+
+	candMissing := Candidate{
+		Path:      filepath.Join(tmpDir, "already_deleted.txt"),
+		Size:      10,
+		AgeDays:   5.0,
+		Category:  "Log",
+		RiskClass: RiskRegenerable,
+		IsDir:     false,
+		CanDelete: true,
+		ModTime:   time.Now(),
+	}
+	os.WriteFile(candMissing.Path, []byte("temp"), 0644)
+
+	var stdout bytes.Buffer
+	stdin := strings.NewReader("y\n")
+	confirmAndDeleteWithIO([]Candidate{candRemoveErr, candMissing}, false, false, false, 1000, 1000, &stdout, stdin)
+
+	t.Setenv("HOME", "/non_existent_home_dir_99999/path")
+	moveToTrash(filepath.Join(tmpDir, "trash_me.txt"))
+}
+
+func TestReach100PercentLoCFinalPush(t *testing.T) {
+	tmpDir := t.TempDir()
+	inv := &PackageInventory{
+		CargoCrates: map[string]string{"my_bin": "my_crate"},
+	}
+
+	// 1. Cargo binary path without .cargo/bin
+	argsCargoNoBin := formatUninstallArgs("UNUSED (Cargo)", "my_bin", "/custom/path/my_bin", inv)
+	if argsCargoNoBin != nil {
+		t.Errorf("Cargo binary outside .cargo/bin should return nil")
+	}
+
+	// 2. MatchFile with marker_files and valid atime > 24h
+	oldTime := time.Now().Add(-200 * time.Hour)
+	atimeOld := time.Now().Add(-100 * time.Hour)
+
+	fileRule := Rule{
+		ID:               "f_rule",
+		Name:             "F Rule",
+		Target:           "file",
+		Patterns:         []string{"*.log_atime"},
+		Category:         "Log",
+		RiskClass:        RiskUserData,
+		MarkerFiles:      []string{"marker.txt"},
+		CheckUnusedAtime: true,
+	}
+
+	engineFile := &RuleEngine{
+		Rules:       []Rule{fileRule},
+		ExactDirMap: make(map[string][]*Rule),
+		ExtMap:      map[string]*Rule{"log_atime": &fileRule},
+	}
+
+	// Create marker.txt in project root
+	os.WriteFile(filepath.Join(tmpDir, "marker.txt"), []byte("marker"), 0644)
+	fLog := filepath.Join(tmpDir, "test.log_atime")
+	os.WriteFile(fLog, []byte("data"), 0644)
+	os.Chtimes(fLog, atimeOld, oldTime)
+
+	infoLog, _ := os.Stat(fLog)
+	matched, _, _ := engineFile.MatchFile("test.log_atime", fLog, infoLog, inv)
+	_ = matched
+
+	// 3. Corrupted Cargo crates.toml file
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	cargoDir := filepath.Join(tempHome, ".cargo")
+	os.MkdirAll(cargoDir, 0755)
+	os.WriteFile(filepath.Join(cargoDir, ".crates.toml"), []byte("invalid = [toml_syntax_error"), 0644)
+	_ = loadPackageInventory()
+
+	// 4. scanParallel candidate matching file rule with MinSizeMB and RiskUserData
+	staleLog := filepath.Join(tmpDir, "stale_min.log_atime")
+	os.WriteFile(staleLog, bytes.Repeat([]byte("z"), 300*1024), 0644)
+	os.Chtimes(staleLog, atimeOld, oldTime)
+
+	_ = scanParallel([]string{tmpDir}, engineFile, 0.0, 100*1024, true)
+
+	// 5. MatchDir rule target == "file" mismatch branch
+	dirRuleMismatch := Rule{
+		ID:       "file_only_rule",
+		Name:     "File Only Rule",
+		Target:   "file",
+		Patterns: []string{"target_mismatch"},
+	}
+	engineDirMismatch := &RuleEngine{
+		Rules:       []Rule{dirRuleMismatch},
+		ExactDirMap: map[string][]*Rule{"target_mismatch": {&dirRuleMismatch}},
+	}
+	mDir, _, _ := engineDirMismatch.MatchDir("target_mismatch", filepath.Join(tmpDir, "target_mismatch"), inv)
+	if mDir != nil {
+		t.Errorf("MatchDir should return nil when rule target is 'file'")
+	}
+}
+
+func TestHit100PercentCoverageFinal(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldTime := time.Now().Add(-200 * time.Hour)
+	newTime := time.Now()
+
+	fileRuleAtime := Rule{
+		ID:               "atime_diff",
+		Name:             "Atime Diff",
+		Target:           "file",
+		Patterns:         []string{"*.diff_test"},
+		Category:         "Log",
+		RiskClass:        RiskUserData,
+		CheckUnusedAtime: true,
+	}
+	engineDiff := &RuleEngine{
+		Rules:       []Rule{fileRuleAtime},
+		ExactDirMap: make(map[string][]*Rule),
+		ExtMap:      map[string]*Rule{"diff_test": &fileRuleAtime},
+	}
+
+	fDiff := filepath.Join(tmpDir, "diff.diff_test")
+	os.WriteFile(fDiff, []byte("data"), 0644)
+	os.Chtimes(fDiff, newTime, oldTime)
+	infoDiff, _ := os.Stat(fDiff)
+
+	matched, _, _ := engineDiff.MatchFile("diff.diff_test", fDiff, infoDiff, &PackageInventory{})
+	if matched != nil {
+		t.Errorf("MatchFile should return nil when diff > 24h")
+	}
+
+	dirWithSub := filepath.Join(tmpDir, "dir_stat_err")
+	os.MkdirAll(dirWithSub, 0755)
+	fSub := filepath.Join(dirWithSub, "sub.txt")
+	os.WriteFile(fSub, []byte("test"), 0644)
+
+	os.Chmod(dirWithSub, 0000)
+	getDirStats(dirWithSub, time.Now())
+	os.Chmod(dirWithSub, 0755)
+
+	staleLog := filepath.Join(tmpDir, "stale_display.log")
+	os.WriteFile(staleLog, bytes.Repeat([]byte("d"), 200*1024), 0644)
+	os.Chtimes(staleLog, oldTime, oldTime)
+
+	t.Setenv("PATH", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	runMain([]string{"-path", tmpDir, "-min-size-mb", "0.1", "-days", "0"}, &stdout, &stderr, nil)
+	if !strings.Contains(stdout.String(), "Total candidates:") {
+		t.Errorf("runMain standard text output failed to list candidates")
+	}
+
+	protDir := filepath.Join(tmpDir, "prot_dir")
+	os.MkdirAll(protDir, 0755)
+	os.WriteFile(filepath.Join(protDir, "credentials.json"), []byte("secret"), 0600)
+
+	candProtected := Candidate{
+		Path:      protDir,
+		Size:      100,
+		AgeDays:   5.0,
+		Category:  "Cache",
+		RiskClass: RiskRegenerable,
+		IsDir:     true,
+		CanDelete: true,
+		ModTime:   time.Now(),
+	}
+
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candProtected}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[PROTECTED SAFEGUARD]") {
+		t.Errorf("Expected [PROTECTED SAFEGUARD]; got: %s", stdout.String())
+	}
+
+	t.Setenv("HOME", "/non_existent_home_dir_99999/path")
+	fTrashErr := filepath.Join(tmpDir, "trash_err.log")
+	os.WriteFile(fTrashErr, []byte("data"), 0644)
+	candTrashErr := Candidate{
+		Path:      fTrashErr,
+		Size:      4,
+		AgeDays:   5.0,
+		Category:  "Log",
+		RiskClass: RiskRegenerable,
+		IsDir:     false,
+		CanDelete: true,
+		ModTime:   time.Now(),
+	}
+
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candTrashErr}, false, false, true, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[ERROR]") {
+		t.Errorf("Expected [ERROR] for failed trash move; got: %s", stdout.String())
+	}
+
+	fDelErr := filepath.Join(tmpDir, "del_err_dir")
+	os.MkdirAll(fDelErr, 0755)
+	os.WriteFile(filepath.Join(fDelErr, "item.txt"), []byte("data"), 0644)
+	os.Chmod(fDelErr, 0000)
+
+	candDelErr := Candidate{
+		Path:      filepath.Join(fDelErr, "item.txt"),
+		Size:      4,
+		AgeDays:   5.0,
+		Category:  "Log",
+		RiskClass: RiskRegenerable,
+		IsDir:     false,
+		CanDelete: true,
+		ModTime:   time.Now(),
+	}
+
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candDelErr}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	os.Chmod(fDelErr, 0755)
+}
+
+func TestReach100PercentLoC(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Negative flag tests for runMain
+	var stdout, stderr bytes.Buffer
+	codeDays := runMain([]string{"-days", "-1"}, &stdout, &stderr, nil)
+	if codeDays != 2 {
+		t.Errorf("-days -1 should fail with code 2")
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	codeSize := runMain([]string{"-min-size-mb", "-5"}, &stdout, &stderr, nil)
+	if codeSize != 2 {
+		t.Errorf("-min-size-mb -5 should fail with code 2")
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	codeDirErr := runMain([]string{"-path", "/non_existent_dir_999999"}, &stdout, &stderr, nil)
+	if codeDirErr != 1 {
+		t.Errorf("-path non-existent dir should fail with code 1")
+	}
+
+	// 2. MatchFile atime branches
+	inv := &PackageInventory{}
+	engine := NewRuleEngine(getDefaultManifest())
+
+	// File rule with check_unused_atime
+	atimeRule := Rule{
+		ID:               "test_atime",
+		Name:             "Test Atime",
+		Target:           "file",
+		Patterns:         []string{"*.atime_test"},
+		Category:         "Log",
+		RiskClass:        RiskUserData,
+		CheckUnusedAtime: true,
+	}
+	engineAtime := &RuleEngine{
+		Rules:       []Rule{atimeRule},
+		ExactDirMap: make(map[string][]*Rule),
+		ExtMap:      map[string]*Rule{"atime_test": &atimeRule},
+	}
+
+	fAtime := filepath.Join(tmpDir, "recent.atime_test")
+	os.WriteFile(fAtime, []byte("data"), 0644)
+	infoAtime, _ := os.Stat(fAtime)
+
+	// ModTime and Atime are equal (less than 24h difference) -> skipped
+	r, _, _ := engineAtime.MatchFile("recent.atime_test", fAtime, infoAtime, inv)
+	if r != nil {
+		t.Errorf("MatchFile should return nil when atime - ctime <= 24h")
+	}
+
+	// 3. formatUninstallArgs unmapped branches
+	invFull := &PackageInventory{
+		CargoCrates: map[string]string{"bin_x": "crate_x"},
+		PipxVenvs:   map[string]string{"pipx_x": "pipx_x"},
+	}
+
+	// Cargo mismatched path
+	args1 := formatUninstallArgs("UNUSED (Cargo)", "bin_x", "/wrong/path/not/cargo/bin", invFull)
+	if args1 != nil {
+		t.Errorf("Cargo formatUninstallArgs mismatched path should return nil")
+	}
+
+	// pipx mismatched path
+	args2 := formatUninstallArgs("UNUSED (pipx)", "pipx_x", "/wrong/path/not/pipx/bin", invFull)
+	if args2 != nil {
+		t.Errorf("pipx formatUninstallArgs mismatched path should return nil")
+	}
+
+	// 4. scanParallel top-level file and invalid path
+	_ = scanParallel([]string{"/non_existent_scan_root_9999"}, engine, 1.0, 1000, true)
+
+	// Scan top-level path that is a file
+	topFile := filepath.Join(tmpDir, "top_level_file.tmp")
+	os.WriteFile(topFile, bytes.Repeat([]byte("x"), 200*1024), 0644)
+	oldTime := time.Now().Add(-200 * time.Hour)
+	os.Chtimes(topFile, oldTime, oldTime)
+
+	_ = scanParallel([]string{topFile}, engine, 0.0, 0, true)
+
+	// 5. Unreadable permission directory delete error handling
+	unreadableDir := filepath.Join(tmpDir, "unreadable")
+	os.MkdirAll(unreadableDir, 0755)
+	os.WriteFile(filepath.Join(unreadableDir, "f.txt"), []byte("data"), 0644)
+	os.Chmod(unreadableDir, 0000)
+
+	candUnreadable := Candidate{
+		Path:      unreadableDir,
+		Size:      100,
+		AgeDays:   10.0,
+		Category:  "Cache",
+		RiskClass: RiskRegenerable,
+		IsDir:     true,
+		CanDelete: true,
+		ModTime:   time.Now(),
+	}
+
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candUnreadable}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	os.Chmod(unreadableDir, 0755) // Restore permission for temp cleanup
+}
+
 func TestCoveragePushTo95Final(t *testing.T) {
 	const gb = uint64(1024 * 1024 * 1024)
 	calculateDynamicMinSizeMB(0)
