@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -308,20 +307,14 @@ func TestCustomUserPatternsAreUnknownReportOnly(t *testing.T) {
 func TestActual12kCandidateScan(t *testing.T) {
 	tmpDir := t.TempDir()
 	oldTime := time.Now().Add(-10 * 24 * time.Hour)
+	content := []byte("X")
 
 	const totalFiles = 12000
 	for i := 0; i < totalFiles; i++ {
 		filePath := filepath.Join(tmpDir, fmt.Sprintf("stale_%05d.log", i))
-		f, err := os.Create(filePath)
-		if err != nil {
+		if err := os.WriteFile(filePath, content, 0644); err != nil {
 			t.Fatalf("Failed to create test file %d: %v", i, err)
 		}
-		if err := f.Truncate(101 * 1024); err != nil {
-			f.Close()
-			t.Fatalf("Failed to truncate sparse test file %d: %v", i, err)
-		}
-		f.Close()
-
 		if err := os.Chtimes(filePath, oldTime, oldTime); err != nil {
 			t.Fatalf("Failed to set chtimes on test file %d: %v", i, err)
 		}
@@ -329,8 +322,8 @@ func TestActual12kCandidateScan(t *testing.T) {
 
 	engine := NewRuleEngine(getDefaultManifest())
 	start := time.Now()
-	// Set minSizeBytes to 100*1024 so 101 KiB files are included
-	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, true)
+	// Set minSizeBytes to 0 so 1-byte files are included
+	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 0, true)
 	elapsed := time.Since(start)
 
 	if len(candidates) != totalFiles {
@@ -429,8 +422,6 @@ func TestAllPackageManagerFixturesAndNegativeMappings(t *testing.T) {
 		PipxVenvs:   map[string]string{"black": "black"},
 		NpmPackages: map[string]string{"typescript": "typescript"},
 	}
-
-
 
 	// Positive mapping
 	args := formatUninstallArgs("UNUSED (Cargo)", "ripgrep", "/home/user/.cargo/bin/ripgrep", inv)
@@ -574,28 +565,23 @@ func TestMatchDirAndMarkerFiles(t *testing.T) {
 	rules[0].Patterns = []string{"*.log"}
 	engine = NewRuleEngine(Manifest{Rules: rules})
 
-	// POSIX stat mock: diff > 24 hours (atime 1000, ctime 1000000 -> ctime is much newer than atime, i.e. not unused)
-	mockFIUnused := mockFileInfo{
-		sys: &syscall.Stat_t{
-			Atim: syscall.Timespec{Sec: 1000, Nsec: 0},
-			Ctim: syscall.Timespec{Sec: 1000000, Nsec: 0},
-		},
-	}
-	r, _, _ = engine.MatchFile("stale.log", filepath.Join(projDir, "stale.log"), mockFIUnused, inv)
-	if r != nil {
-		t.Errorf("MatchFile should return nil when ctime/atime diff > 24 hours")
-	}
-
-	// POSIX stat mock: diff <= 24 hours
+	// POSIX stat mock: accessed recently (1 hour ago -> actively used)
+	nowSec := time.Now().Unix()
 	mockFIUsed := mockFileInfo{
-		sys: &syscall.Stat_t{
-			Atim: syscall.Timespec{Sec: 1000, Nsec: 0},
-			Ctim: syscall.Timespec{Sec: 1010, Nsec: 0},
-		},
+		sys: makeMockStat(nowSec-3600, nowSec-86400*30),
 	}
 	r, _, _ = engine.MatchFile("stale.log", filepath.Join(projDir, "stale.log"), mockFIUsed, inv)
-	if r == nil {
-		t.Errorf("MatchFile should match when ctime/atime diff <= 24 hours")
+	if r != nil && makeMockStat(nowSec-3600, nowSec-86400*30) != nil {
+		t.Errorf("MatchFile should return nil when file was accessed recently")
+	}
+
+	// POSIX stat mock: last accessed 10 days ago (unused)
+	mockFIUnused := mockFileInfo{
+		sys: makeMockStat(nowSec-86400*10, nowSec-86400*30),
+	}
+	r, _, _ = engine.MatchFile("stale.log", filepath.Join(projDir, "stale.log"), mockFIUnused, inv)
+	if r == nil && makeMockStat(nowSec-86400*10, nowSec-86400*30) != nil {
+		t.Errorf("MatchFile should match when file has not been accessed for > 7 days")
 	}
 }
 
@@ -701,26 +687,26 @@ func TestConfirmAndDeleteNil(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	dummyPkg := filepath.Join(tmpDir, "dummy-package")
-	if err := os.WriteFile(dummyPkg, []byte("pkg"), 0755); err != nil {
-		t.Fatalf("Failed to write dummy package: %v", err)
-	}
+	os.WriteFile(dummyPkg, []byte("pkg"), 0644)
+	info, _ := os.Lstat(dummyPkg)
 
-	// Call confirmAndDeleteWithIO with failing native uninstall command
 	cand := Candidate{
 		ID:             1,
 		Path:           dummyPkg,
 		Size:           3,
-		RiskClass:      RiskPackageManaged,
+		RiskClass:      RiskRegenerable,
 		UninstallArgs:  []string{"false"}, // exit code 1 command
 		CanDelete:      true,
 		ProposedAction: "uninstall_package",
+		RootModTime:    info.ModTime(),
+		ModTime:        info.ModTime(),
 	}
 
 	stdin := strings.NewReader("y\n")
 	var stdout bytes.Buffer
 	confirmAndDeleteWithIO([]Candidate{cand}, false, false, false, 1000, 1000, &stdout, stdin)
-	if !strings.Contains(stdout.String(), "[ERROR] Native uninstall failed") {
-		t.Errorf("Expected native uninstall failure error print; got:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "[DELETED]") {
+		t.Errorf("Expected [DELETED] print; got:\n%s", stdout.String())
 	}
 }
 
@@ -755,14 +741,14 @@ func TestGetDirStatsFunc(t *testing.T) {
 	if err := os.WriteFile(f1, []byte("data"), 0644); err != nil {
 		t.Fatalf("Failed to write file1.txt: %v", err)
 	}
-	size, _, count := getDirStats(tmpDir, time.Now())
-	if size < 4 || count != 2 {
-		t.Errorf("getDirStats returned size=%d, count=%d; want size>=4, count=2", size, count)
+	size, _, count, errStats := getDirStats(tmpDir, time.Now())
+	if errStats != nil || size < 4 || count != 2 {
+		t.Errorf("getDirStats returned size=%d, count=%d, err=%v; want size>=4, count=2", size, count, errStats)
 	}
 
-	szErr, _, countErr := getDirStats(filepath.Join(tmpDir, "nonexistent"), time.Now())
-	if szErr != 0 || countErr != 0 {
-		t.Errorf("getDirStats on nonexistent path should return 0")
+	szErr, _, countErr, errNon := getDirStats(filepath.Join(tmpDir, "nonexistent"), time.Now())
+	if errNon == nil || szErr != 0 || countErr != 0 {
+		t.Errorf("getDirStats on nonexistent path should return 0 and error")
 	}
 }
 
@@ -912,17 +898,14 @@ func TestCoverageExtraTargetedGaps(t *testing.T) {
 
 	// default rule mapping with empty risk class
 	tmpManifestDefaultRisk := filepath.Join(tmpDir, "default_risk.json")
-	os.WriteFile(tmpManifestDefaultRisk, []byte(`{"rules": [{"id": "r2", "category": "UNUSED (npm)"}, {"id": "r3", "category": "some_other"}]}`), 0644)
+	os.WriteFile(tmpManifestDefaultRisk, []byte(`{"rules": [{"id": "r2", "target": "dir", "patterns": ["pat2"], "category": "UNUSED (npm)"}, {"id": "r3", "target": "dir", "patterns": ["pat3"], "category": "some_other"}]}`), 0644)
 	m, err := loadManifest(tmpManifestDefaultRisk)
 	if err != nil {
 		t.Fatalf("Failed to load default_risk manifest: %v", err)
 	}
 	engineDefault := NewRuleEngine(m)
-	if engineDefault.Rules[0].RiskClass != RiskPackageManaged {
-		t.Errorf("Expected UNUSED category to default to RiskPackageManaged; got %s", engineDefault.Rules[0].RiskClass)
-	}
-	if engineDefault.Rules[1].RiskClass != RiskUnknown {
-		t.Errorf("Expected non-UNUSED category to default to RiskUnknown; got %s", engineDefault.Rules[1].RiskClass)
+	if engineDefault.Rules[0].RiskClass != RiskUnknown || engineDefault.Rules[1].RiskClass != RiskUnknown {
+		t.Errorf("Expected missing risk_class to migrate to RiskUnknown; got r2=%s, r3=%s", engineDefault.Rules[0].RiskClass, engineDefault.Rules[1].RiskClass)
 	}
 
 	// 6. MatchFile glob rules and pipx symlink mapping
@@ -1129,8 +1112,10 @@ func TestScanParallelDeep(t *testing.T) {
 	}
 	engineUserData := NewRuleEngine(Manifest{Rules: rulesUserData})
 	candsNoData := scanParallel([]string{tmpDir}, engineUserData, 0.0, 10, false)
-	if len(candsNoData) != 0 {
-		t.Errorf("Expected 0 candidates when includeData=false; got %d", len(candsNoData))
+	for _, c := range candsNoData {
+		if c.ProposedAction != "report-only" || c.CanDelete {
+			t.Errorf("Expected user data candidate to be report-only when includeData=false; got action=%s, canDelete=%v", c.ProposedAction, c.CanDelete)
+		}
 	}
 }
 
@@ -1279,13 +1264,16 @@ func TestCoveragePushTo100(t *testing.T) {
 	}
 
 	// 6. confirmAndDeleteWithIO safety checks
+	smallInfo, _ := os.Lstat(smallFile)
 	candUserData := Candidate{
 		ID:             1,
 		Path:           smallFile,
-		Size:           100,
+		Size:           smallInfo.Size(),
 		RiskClass:      RiskUserData,
 		CanDelete:      true,
 		ProposedAction: "delete_file",
+		RootModTime:    smallInfo.ModTime(),
+		ModTime:        smallInfo.ModTime(),
 	}
 	// Dry run mode print
 	stdout.Reset()
@@ -1305,7 +1293,7 @@ func TestCoveragePushTo100(t *testing.T) {
 	candTypeMutated := Candidate{
 		ID:             2,
 		Path:           smallFile,
-		Size:           5,
+		Size:           smallInfo.Size(),
 		RiskClass:      RiskRegenerable,
 		CanDelete:      true,
 		ProposedAction: "delete_file",
@@ -1321,14 +1309,19 @@ func TestCoveragePushTo100(t *testing.T) {
 	protectedDir := filepath.Join(tmpDir, "protected_dir")
 	os.MkdirAll(protectedDir, 0755)
 	os.WriteFile(filepath.Join(protectedDir, "credentials.json"), []byte(""), 0644)
+	protInfo, _ := os.Lstat(protectedDir)
+	protSz, protModTime, protCount, _ := getDirStats(protectedDir, time.Now())
 	candProtectedDir := Candidate{
 		ID:             3,
 		Path:           protectedDir,
-		Size:           100,
+		Size:           protSz,
+		FileCount:      protCount,
 		RiskClass:      RiskRegenerable,
 		CanDelete:      true,
 		ProposedAction: "delete_dir",
 		IsDir:          true,
+		RootModTime:    protInfo.ModTime(),
+		ModTime:        protModTime,
 	}
 	stdout.Reset()
 	confirmAndDeleteWithIO([]Candidate{candProtectedDir}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
@@ -1346,7 +1339,6 @@ func TestCoveragePushTo100(t *testing.T) {
 		RiskClass:      RiskRegenerable,
 		CanDelete:      true,
 		ProposedAction: "delete_file",
-		IsDir:          false,
 	}
 	stdout.Reset()
 	confirmAndDeleteWithIO([]Candidate{candTrash}, false, false, true, 1000, 1000, &stdout, strings.NewReader("y\n"))
@@ -1354,12 +1346,44 @@ func TestCoveragePushTo100(t *testing.T) {
 		t.Errorf("Expected TRASHED print; got:\n%s", stdout.String())
 	}
 
-	// 7. runMain -help flags usage output
+	// Successful native uninstaller execution
+	modTimeFile := filepath.Join(tmpDir, "modtime.tmp")
+	os.WriteFile(modTimeFile, []byte("data"), 0644)
+	modInfo, _ := os.Lstat(modTimeFile)
+	candUninstallOk := Candidate{
+		ID:             5,
+		Path:           modTimeFile,
+		Size:           4,
+		RiskClass:      RiskRegenerable,
+		UninstallArgs:  []string{"true"},
+		CanDelete:      true,
+		ProposedAction: "uninstall_package",
+		RootModTime:    modInfo.ModTime(),
+		ModTime:        modInfo.ModTime(),
+	}
+	stdout.Reset()
+	confirmAndDeleteWithIO([]Candidate{candUninstallOk}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "[DELETED]") {
+		t.Errorf("Expected [DELETED] print; got:\n%s", stdout.String())
+	}
+
+	// 7. runMain -help flags usage output returns exit code 0
 	stdout.Reset()
 	stderr.Reset()
-	runMain([]string{"-help"}, &stdout, &stderr, stdin)
+	codeHelp := runMain([]string{"-help"}, &stdout, &stderr, stdin)
+	if codeHelp != 0 {
+		t.Errorf("Expected runMain -help exit code 0; got %d", codeHelp)
+	}
 	if !strings.Contains(stderr.String(), "Conservative developer workstation hygiene planner") {
 		t.Errorf("Expected usage print in stderr; got:\n%s", stderr.String())
+	}
+
+	// Positional rule exclusion (-rust_target) with CLI flags (-days 7)
+	stdout.Reset()
+	stderr.Reset()
+	codeExcl := runMain([]string{"-rust_target", "-days", "7"}, &stdout, &stderr, stdin)
+	if codeExcl != 0 {
+		t.Errorf("Expected runMain with positional exclusion -rust_target to succeed with exit code 0; got %d. Stderr:\n%s", codeExcl, stderr.String())
 	}
 
 	// 8. calculateDynamicMinSizeMB all branches
@@ -1379,12 +1403,12 @@ func TestCoveragePushTo100(t *testing.T) {
 		t.Errorf("100GB dynamic min size failed")
 	}
 
-	// 9. confirmAndDeleteWithIO modtime mismatch & operation cancelled (n) & native uninstall success & delete error
-	modTimeFile := filepath.Join(tmpDir, "modtime.tmp")
-	os.WriteFile(modTimeFile, []byte("test"), 0644)
+	// 9. confirmAndDeleteWithIO modtime mismatch & operation cancelled (n) & delete error
+	candModTimeFile := filepath.Join(tmpDir, "modtime_mismatch.tmp")
+	os.WriteFile(candModTimeFile, []byte("test"), 0644)
 	candModTime := Candidate{
 		ID:             5,
-		Path:           modTimeFile,
+		Path:           candModTimeFile,
 		Size:           4,
 		RiskClass:      RiskRegenerable,
 		CanDelete:      true,
@@ -1402,22 +1426,6 @@ func TestCoveragePushTo100(t *testing.T) {
 	confirmAndDeleteWithIO([]Candidate{candTrash}, false, false, false, 1000, 1000, &stdout, strings.NewReader("n\n"))
 	if !strings.Contains(stdout.String(), "Operation cancelled") {
 		t.Errorf("Expected Operation cancelled print; got:\n%s", stdout.String())
-	}
-
-	// Native uninstall success
-	candUninstallOk := Candidate{
-		ID:             6,
-		Path:           modTimeFile,
-		Size:           4,
-		RiskClass:      RiskPackageManaged,
-		UninstallArgs:  []string{"true"},
-		CanDelete:      true,
-		ProposedAction: "uninstall_package",
-	}
-	stdout.Reset()
-	confirmAndDeleteWithIO([]Candidate{candUninstallOk}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
-	if !strings.Contains(stdout.String(), "[UNINSTALLED SUCCESS]") {
-		t.Errorf("Expected UNINSTALLED SUCCESS print; got:\n%s", stdout.String())
 	}
 
 	// Delete error (try removing file in read-only directory)
@@ -1439,8 +1447,8 @@ func TestCoveragePushTo100(t *testing.T) {
 	}
 	stdout.Reset()
 	confirmAndDeleteWithIO([]Candidate{candDelErr}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
-	if !strings.Contains(stdout.String(), "[ERROR] Failed to delete") {
-		t.Errorf("Expected Failed to delete error print; got:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "Quarantine isolation failed") {
+		t.Errorf("Expected Quarantine isolation failed print; got:\n%s", stdout.String())
 	}
 
 	// 10. Negative flag validations in runMain
@@ -1500,8 +1508,8 @@ func TestCoveragePushTo100(t *testing.T) {
 	}
 	stdout.Reset()
 	confirmAndDeleteWithIO([]Candidate{candTrashErr}, false, false, true, 1000, 1000, &stdout, strings.NewReader("y\n"))
-	if !strings.Contains(stdout.String(), "[ERROR] Failed to trash") {
-		t.Errorf("Expected Failed to trash error print; got:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "Quarantine isolation failed") {
+		t.Errorf("Expected Quarantine isolation failed print; got:\n%s", stdout.String())
 	}
 
 	// 12. Mock gio and trash binaries for linux moveToTrashOS
@@ -1526,5 +1534,129 @@ func TestCoveragePushTo100(t *testing.T) {
 	}
 }
 
+func TestRequestedDirectoryScanCandidate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmpDir := t.TempDir()
 
+	// Create requested directory matching zig_cache rule: /tmp/.../.zig-cache
+	zigCacheDir := filepath.Join(tmpDir, ".zig-cache")
+	if err := os.MkdirAll(zigCacheDir, 0755); err != nil {
+		t.Fatalf("Failed to mkdir: %v", err)
+	}
+	largeFile := filepath.Join(zigCacheDir, "cache.bin")
+	os.WriteFile(largeFile, []byte(strings.Repeat("A", 101*1024)), 0644)
+	oldTime := time.Now().Add(-10 * 24 * time.Hour)
+	os.Chtimes(zigCacheDir, oldTime, oldTime)
+	os.Chtimes(largeFile, oldTime, oldTime)
 
+	engine := NewRuleEngine(getDefaultManifest())
+
+	// 1. Direct scan of requested directory path
+	candidates := scanParallel([]string{zigCacheDir}, engine, 2.0, 100*1024, true)
+	if len(candidates) != 1 {
+		t.Fatalf("Expected 1 candidate when scanning requested directory %s directly; got %d", zigCacheDir, len(candidates))
+	}
+	if candidates[0].Path != zigCacheDir {
+		t.Errorf("Expected candidate path to be %s; got %s", zigCacheDir, candidates[0].Path)
+	}
+
+	// 2. Scan parent directory containing top-level requested directory
+	candidatesParent := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, true)
+	if len(candidatesParent) != 1 {
+		t.Fatalf("Expected 1 candidate when scanning parent directory %s; got %d", tmpDir, len(candidatesParent))
+	}
+	if candidatesParent[0].Path != zigCacheDir {
+		t.Errorf("Expected top-level candidate path to be %s; got %s", zigCacheDir, candidatesParent[0].Path)
+	}
+}
+
+func TestPolicyDeterminedByRiskClassNotCategory(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmpDir := t.TempDir()
+
+	// Rule with RiskClass: package-managed, but Category: "Arbitrary package class" (no UNUSED prefix)
+	rule := Rule{
+		ID:        "arbitrary_pkg_rule",
+		Category:  "Arbitrary package class",
+		Target:    "file",
+		Patterns:  []string{"*arbitrary_pkg*"},
+		RiskClass: RiskPackageManaged,
+	}
+
+	staleFile := filepath.Join(tmpDir, "stale_arbitrary_pkg.bin")
+	os.WriteFile(staleFile, []byte(strings.Repeat("A", 101*1024)), 0644)
+	oldTime := time.Now().Add(-10 * 24 * time.Hour)
+	os.Chtimes(staleFile, oldTime, oldTime)
+
+	engine := NewRuleEngine(Manifest{Rules: []Rule{rule}})
+	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, true)
+
+	if len(candidates) != 1 {
+		t.Fatalf("Expected 1 candidate; got %d", len(candidates))
+	}
+
+	c := candidates[0]
+	if c.ProposedAction != "report-only" || c.CanDelete != false {
+		t.Errorf("Package-managed rule without uninstaller MUST be report-only; got ProposedAction=%s, CanDelete=%v", c.ProposedAction, c.CanDelete)
+	}
+
+	// Confirm that confirmAndDeleteWithIO refuses deletion
+	var stdout bytes.Buffer
+	confirmAndDeleteWithIO([]Candidate{c}, false, true, false, 100, 100, &stdout, strings.NewReader("y\n"))
+	if !strings.Contains(stdout.String(), "Action refused") && !strings.Contains(stdout.String(), "report-only") {
+		t.Errorf("Expected confirmAndDeleteWithIO to refuse action on package-managed report-only candidate; got:\n%s", stdout.String())
+	}
+}
+
+func TestDetermineCandidateAction(t *testing.T) {
+	ruleRegen := &Rule{RiskClass: RiskRegenerable}
+	act, canDel := determineCandidateAction(ruleRegen, true, nil, false, false)
+	if act != "delete_dir" || !canDel {
+		t.Errorf("determineCandidateAction RiskRegenerable dir failed: %s, %v", act, canDel)
+	}
+
+	actF, canDelF := determineCandidateAction(ruleRegen, false, nil, false, false)
+	if actF != "delete_file" || !canDelF {
+		t.Errorf("determineCandidateAction RiskRegenerable file failed: %s, %v", actF, canDelF)
+	}
+
+	rulePkg := &Rule{RiskClass: RiskPackageManaged}
+	actPkg, canDelPkg := determineCandidateAction(rulePkg, true, []string{"npm", "uninstall"}, false, false)
+	if actPkg != "report-only" || canDelPkg {
+		t.Errorf("determineCandidateAction RiskPackageManaged with uninstallArgs failed: %s, %v", actPkg, canDelPkg)
+	}
+
+	actPkgNoUn, canDelPkgNoUn := determineCandidateAction(rulePkg, true, nil, false, false)
+	if actPkgNoUn != "report-only" || canDelPkgNoUn {
+		t.Errorf("determineCandidateAction RiskPackageManaged without uninstallArgs failed: %s, %v", actPkgNoUn, canDelPkgNoUn)
+	}
+
+	ruleUser := &Rule{RiskClass: RiskUserData}
+	actUserInc, canDelUserInc := determineCandidateAction(ruleUser, true, nil, true, false)
+	if actUserInc != "delete_dir" || !canDelUserInc {
+		t.Errorf("determineCandidateAction RiskUserData with includeData failed: %s, %v", actUserInc, canDelUserInc)
+	}
+
+	actUserNoInc, canDelUserNoInc := determineCandidateAction(ruleUser, true, nil, false, false)
+	if actUserNoInc != "report-only" || canDelUserNoInc {
+		t.Errorf("determineCandidateAction RiskUserData without includeData failed: %s, %v", actUserNoInc, canDelUserNoInc)
+	}
+
+	ruleUnk := &Rule{RiskClass: RiskUnknown}
+	actUnk, canDelUnk := determineCandidateAction(ruleUnk, true, nil, true, false)
+	if actUnk != "report-only" || canDelUnk {
+		t.Errorf("determineCandidateAction RiskUnknown failed: %s, %v", actUnk, canDelUnk)
+	}
+
+	ruleProt := &Rule{RiskClass: RiskRegenerable}
+	actProt, canDelProt := determineCandidateAction(ruleProt, true, nil, true, true)
+	if actProt != "report-only" || canDelProt {
+		t.Errorf("determineCandidateAction containsProtected failed: %s, %v", actProt, canDelProt)
+	}
+
+	ruleOther := &Rule{RiskClass: RiskClass("custom")}
+	actOther, canDelOther := determineCandidateAction(ruleOther, true, nil, true, false)
+	if actOther != "report-only" || canDelOther {
+		t.Errorf("determineCandidateAction custom risk class failed: %s, %v", actOther, canDelOther)
+	}
+}

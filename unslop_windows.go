@@ -39,6 +39,7 @@ func getDiskSpaceSyscall(path string) (uint64, uint64, uint64, error) {
 }
 
 func moveToTrashOS(path string) error {
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", "param($p); Remove-Item -LiteralPath $p -Recycle -Force", path)
+	script := `param($p); Add-Type -AssemblyName Microsoft.VisualBasic; if (Test-Path -LiteralPath $p -PathType Container) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p, 'OnlyErrorDialogs', 'SendToRecycleBin') } else { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, 'OnlyErrorDialogs', 'SendToRecycleBin') }`
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script, path)
 	return cmd.Run()
 }

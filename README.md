@@ -48,11 +48,11 @@ unslop -include-data
 # Custom age window (e.g. 14 days) and minimum size (e.g. 10 MB)
 unslop -days 14 -min-size-mb 10
 
-# Move candidates to Trash instead of permanent deletion
-unslop -trash -apply
-
-# Enable permanent deletion mode (requires explicit -apply)
+# Move candidates to System Trash (Trash mode is enabled by default)
 unslop -apply
+
+# Perform permanent deletion without Trash (bypasses system Trash)
+unslop -apply -force-permanent
 ```
 
 ---
