@@ -711,6 +711,27 @@ func globMatch(pattern, str string) bool {
 	return px == len(pattern)
 }
 
+func shouldWarnConflict(r1, r2 Rule) bool {
+	if len(r1.MarkerFiles) == 0 && len(r2.MarkerFiles) == 0 && len(r1.InternalMarkerFiles) == 0 && len(r2.InternalMarkerFiles) == 0 {
+		return true
+	}
+	for _, m1 := range r1.MarkerFiles {
+		for _, m2 := range r2.MarkerFiles {
+			if strings.EqualFold(m1, m2) {
+				return true
+			}
+		}
+	}
+	for _, m1 := range r1.InternalMarkerFiles {
+		for _, m2 := range r2.InternalMarkerFiles {
+			if strings.EqualFold(m1, m2) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func validateManifest(m Manifest) error {
 	if m.Version > 1 {
 		return fmt.Errorf("unsupported manifest version %d (supported max version: 1)", m.Version)
@@ -718,6 +739,7 @@ func validateManifest(m Manifest) error {
 
 	seenIDs := make(map[string]bool)
 	seenPatterns := make(map[string]string)
+	existingRuleByID := make(map[string]Rule)
 
 	for _, r := range m.Rules {
 		if strings.TrimSpace(r.ID) == "" {
@@ -727,6 +749,7 @@ func validateManifest(m Manifest) error {
 			return fmt.Errorf("duplicate rule ID '%s' found in manifest", r.ID)
 		}
 		seenIDs[r.ID] = true
+		existingRuleByID[r.ID] = r
 
 		if r.Target != "dir" && r.Target != "file" && r.Target != "any" {
 			return fmt.Errorf("rule '%s' has invalid target '%s' (must be 'dir', 'file', or 'any')", r.ID, r.Target)
@@ -741,8 +764,11 @@ func validateManifest(m Manifest) error {
 				return fmt.Errorf("rule '%s' contains empty pattern string", r.ID)
 			}
 			key := fmt.Sprintf("%s:%s", r.Target, pat)
-			if existingRule, exists := seenPatterns[key]; exists {
-				fmt.Fprintf(os.Stderr, "[MANIFEST WARNING] Rule '%s' pattern '%s' (target: %s) conflicts with rule '%s'.\n", r.ID, pat, r.Target, existingRule)
+			if existingRuleID, exists := seenPatterns[key]; exists {
+				existingRule := existingRuleByID[existingRuleID]
+				if shouldWarnConflict(r, existingRule) {
+					fmt.Fprintf(os.Stderr, "[MANIFEST WARNING] Rule '%s' pattern '%s' (target: %s) conflicts with rule '%s'.\n", r.ID, pat, r.Target, existingRuleID)
+				}
 			} else {
 				seenPatterns[key] = r.ID
 			}
