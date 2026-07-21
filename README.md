@@ -104,5 +104,6 @@ unslop -apply
 
 ## License
 
-[BSD 3-Clause License](LICENSE.txt)
+[BSD 3-Clause License](LICENSE)
+
 
