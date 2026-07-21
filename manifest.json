@@ -1,0 +1,144 @@
+{
+  "rules": [
+    {
+      "id": "zig_cache",
+      "name": "Zig Build Cache",
+      "target": "dir",
+      "patterns": [".zig-cache", "zig-cache", ".clear-cache", "clear-cache", ".clear-transpile-cache"],
+      "category": "Cache Dir"
+    },
+    {
+      "id": "build_target",
+      "name": "Project Build Targets",
+      "target": "dir",
+      "patterns": ["target", ".gradle", ".nuget", ".m2", ".npm", ".rubies", "node_modules/.cache", "kcov", "tmp*", "temp*", "_tmp*", "_temp*", "*.tmp", "*.temp", "*-tmp", "*-temp"],
+      "category": "Cache Dir"
+    },
+    {
+      "id": "llm_models",
+      "name": "LLM Models & Weights",
+      "target": "any",
+      "patterns": ["*.gguf", "*.safetensors", "*.ckpt", "*.gexf", "*.llamafile", ".ollama/models", ".cache/huggingface/hub", ".lmstudio/models", ".cache/lm-studio", "jan/models", ".cache/llama.cpp"],
+      "category": "LLM Model"
+    },
+    {
+      "id": "agent_sessions",
+      "name": "AI Agent Sessions",
+      "target": "any",
+      "patterns": ["rollout-*.jsonl", ".codex/sessions", ".gemini/antigravity-cli/conversations"],
+      "category": "Agent Session"
+    },
+    {
+      "id": "agent_cache",
+      "name": "AI Agent Caches",
+      "target": "dir",
+      "patterns": [".codex/cache", ".codex/tmp", ".codex/.tmp", ".claude/cache", ".claude/paste-cache", ".gemini/antigravity-cli/cache", ".gemini/antigravity-cli/implicit", ".config/Cursor/Cache", ".config/Cursor/GPUCache", ".config/Cursor/User/workspaceStorage"],
+      "category": "Agent Cache"
+    },
+    {
+      "id": "agent_logs",
+      "name": "AI Agent Logs",
+      "target": "any",
+      "patterns": [".claude/debug", ".gemini/antigravity-cli/log", ".gemini/antigravity-cli/crashes", ".config/Cursor/logs"],
+      "category": "Agent Log"
+    },
+    {
+      "id": "agent_history",
+      "name": "AI Agent File History",
+      "target": "any",
+      "patterns": [".claude/file-history"],
+      "category": "Agent History"
+    },
+    {
+      "id": "json_artifacts",
+      "name": "Large JSON Dumps",
+      "target": "file",
+      "patterns": ["*.json", "*.jsonl"],
+      "category": "JSON Artifact",
+      "min_size_mb": 5.0
+    },
+    {
+      "id": "profile_data",
+      "name": "Profile & Trace Dumps",
+      "target": "file",
+      "patterns": ["*.profile", "*.pprof", "perf.data*", "*.cpuprofile", "*.heapprofile", "*profile*.json", "*.trace", "trace*.err", "*.dmp", "bench.profile"],
+      "category": "Profile/Trace"
+    },
+    {
+      "id": "temp_files",
+      "name": "Temporary Files",
+      "target": "file",
+      "patterns": ["*.ll", "*.bc", "*.log", "*.err", "*.out"],
+      "category": "Temp File"
+    },
+    {
+      "id": "cargo_pkg",
+      "name": "Unused Cargo Package",
+      "target": "file",
+      "patterns": ["*/.cargo/bin/*"],
+      "category": "UNUSED (Cargo)",
+      "uninstall_cmd": "cargo uninstall {name}",
+      "check_unused_atime": true
+    },
+    {
+      "id": "npm_pkg",
+      "name": "Unused npm Package",
+      "target": "file",
+      "patterns": ["*/.nvm/versions/node/*/bin/*", "*/.npm-global/bin/*"],
+      "category": "UNUSED (npm)",
+      "uninstall_cmd": "npm uninstall -g {name}",
+      "check_unused_atime": true
+    },
+    {
+      "id": "pipx_pkg",
+      "name": "Unused pipx Package",
+      "target": "file",
+      "patterns": ["*/.local/pipx/venvs/*", "*/.local/bin/*"],
+      "category": "UNUSED (pipx)",
+      "uninstall_cmd": "pipx uninstall {name}",
+      "check_unused_atime": true
+    },
+    {
+      "id": "swift_toolchain",
+      "name": "Unused Swift Toolchain",
+      "target": "dir",
+      "patterns": ["*/.local/share/swiftly/toolchains/*"],
+      "category": "UNUSED (Swift)",
+      "uninstall_cmd": "swiftly uninstall {name}"
+    },
+    {
+      "id": "sdkman_cand",
+      "name": "Unused SDKMAN Candidate",
+      "target": "dir",
+      "patterns": ["*/.sdkman/candidates/*/*"],
+      "category": "UNUSED (SDKMAN)",
+      "uninstall_cmd": "sdk uninstall {candidate} {version}"
+    },
+    {
+      "id": "dotnet_pkg",
+      "name": "Unused .NET Tool",
+      "target": "file",
+      "patterns": ["*/.dotnet/tools/*"],
+      "category": "UNUSED (Dotnet)",
+      "uninstall_cmd": "dotnet tool uninstall -g {name}",
+      "check_unused_atime": true
+    },
+    {
+      "id": "composer_pkg",
+      "name": "Unused Composer Package",
+      "target": "file",
+      "patterns": ["*/.config/composer/vendor/bin/*", "*/.composer/vendor/bin/*"],
+      "category": "UNUSED (Composer)",
+      "uninstall_cmd": "composer global remove {name}",
+      "check_unused_atime": true
+    },
+    {
+      "id": "zvm_toolchain",
+      "name": "Unused Zig Toolchain",
+      "target": "any",
+      "patterns": ["*/.zvm/bin/*", "*/.zvm/zig/*"],
+      "category": "UNUSED (ZVM)",
+      "uninstall_cmd": "zvm remove {name}"
+    }
+  ]
+}
