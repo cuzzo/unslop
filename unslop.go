@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -71,16 +72,17 @@ type Candidate struct {
 
 // Rule defines a single declarative scanning rule
 type Rule struct {
-	ID               string    `json:"id"`
-	Name             string    `json:"name"`
-	Target           string    `json:"target"` // "dir", "file", "any"
-	Patterns         []string  `json:"patterns"`
-	Category         string    `json:"category"`
-	RiskClass        RiskClass `json:"risk_class"`
-	MinSizeMB        float64   `json:"min_size_mb,omitempty"`
-	MarkerFiles      []string  `json:"marker_files,omitempty"`
-	UninstallArgs    []string  `json:"uninstall_args,omitempty"`
-	CheckUnusedAtime bool      `json:"check_unused_atime,omitempty"`
+	ID                  string    `json:"id"`
+	Name                string    `json:"name"`
+	Target              string    `json:"target"` // "dir", "file", "any"
+	Patterns            []string  `json:"patterns"`
+	Category            string    `json:"category"`
+	RiskClass           RiskClass `json:"risk_class"`
+	MinSizeMB           float64   `json:"min_size_mb,omitempty"`
+	MarkerFiles         []string  `json:"marker_files,omitempty"`
+	InternalMarkerFiles []string  `json:"internal_marker_files,omitempty"`
+	UninstallArgs       []string  `json:"uninstall_args,omitempty"`
+	CheckUnusedAtime    bool      `json:"check_unused_atime,omitempty"`
 }
 
 // Manifest defines the top-level manifest file structure
@@ -343,12 +345,82 @@ func hasMarkerFile(dirPath string, markers []string) bool {
 	return false
 }
 
+func hasInternalMarkerFile(dirPath string, markers []string) bool {
+	if len(markers) == 0 {
+		return true
+	}
+	for _, m := range markers {
+		if _, err := os.Stat(filepath.Join(dirPath, m)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func getDeviceID(path string) (uint64, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return uint64(stat.Dev), nil
+	}
+	return 0, nil
+}
+
+func containsMountOrReparsePoint(dirPath string) (bool, string, error) {
+	rootDev, err := getDeviceID(dirPath)
+	if err != nil {
+		return false, "", err
+	}
+
+	var boundaryPath string
+	var boundaryErr error
+
+	errWalk := filepath.WalkDir(dirPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if path == dirPath {
+			return nil
+		}
+
+		fi, errInfo := d.Info()
+		if errInfo != nil {
+			return nil
+		}
+
+		if fi.Mode()&os.ModeSymlink != 0 || fi.Mode()&os.ModeIrregular != 0 {
+			boundaryPath = path
+			boundaryErr = fmt.Errorf("reparse point or symlink boundary detected at %s", path)
+			return filepath.SkipDir
+		}
+
+		if rootDev != 0 {
+			if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+				if uint64(stat.Dev) != rootDev {
+					boundaryPath = path
+					boundaryErr = fmt.Errorf("cross-filesystem mount boundary detected at %s", path)
+					return filepath.SkipDir
+				}
+			}
+		}
+
+		return nil
+	})
+
+	if boundaryPath != "" {
+		return true, boundaryPath, boundaryErr
+	}
+	return false, "", errWalk
+}
+
 func (re *RuleEngine) MatchDir(name, path string, inv *PackageInventory) (*Rule, string, []string) {
 	nameLower := strings.ToLower(name)
 	if rules, found := re.ExactDirMap[nameLower]; found {
 		for _, rule := range rules {
 			if rule.Target == "dir" || rule.Target == "any" {
-				if hasMarkerFile(path, rule.MarkerFiles) {
+				if hasMarkerFile(path, rule.MarkerFiles) && hasInternalMarkerFile(path, rule.InternalMarkerFiles) {
 					args := formatUninstallArgs(rule.Category, name, path, inv)
 					return rule, name, args
 				}
@@ -360,7 +432,7 @@ func (re *RuleEngine) MatchDir(name, path string, inv *PackageInventory) (*Rule,
 		if rule.Target == "dir" || rule.Target == "any" {
 			for _, pat := range rule.Patterns {
 				if matchPattern(pathClean, pat) || matchPattern(name, pat) {
-					if hasMarkerFile(path, rule.MarkerFiles) {
+					if hasMarkerFile(path, rule.MarkerFiles) && hasInternalMarkerFile(path, rule.InternalMarkerFiles) {
 						args := formatUninstallArgs(rule.Category, name, path, inv)
 						return rule, name, args
 					}
@@ -830,11 +902,41 @@ func getDirStats(dirPath string, now time.Time) (size int64, maxModTime time.Tim
 	return sz, maxMod, count, err
 }
 
-func rollbackQuarantine(origPath, quarantinePath string) error {
+func rollbackQuarantine(origPath, quarantinePath string, out ...io.Writer) error {
 	if _, err := os.Lstat(quarantinePath); os.IsNotExist(err) {
 		return nil
 	}
-	return os.Rename(quarantinePath, origPath)
+
+	destPath := origPath
+	isOccupied := false
+
+	if _, errStat := os.Lstat(origPath); errStat == nil {
+		isOccupied = true
+		nowNano := time.Now().UnixNano()
+		destPath = fmt.Sprintf("%s.restored-%d", origPath, nowNano)
+		counter := 1
+		for {
+			if _, errDest := os.Lstat(destPath); os.IsNotExist(errDest) {
+				break
+			}
+			destPath = fmt.Sprintf("%s.restored-%d-%d", origPath, nowNano, counter)
+			counter++
+		}
+	}
+
+	if errRename := os.Rename(quarantinePath, destPath); errRename != nil {
+		return errRename
+	}
+
+	if isOccupied {
+		var w io.Writer = os.Stdout
+		if len(out) > 0 && out[0] != nil {
+			w = out[0]
+		}
+		fmt.Fprintf(w, " [ROLLBACK COLLISION] Original path '%s' is occupied! Restored quarantine to collision-safe path '%s'\n", origPath, destPath)
+	}
+
+	return nil
 }
 
 func renderProgressBar(percentage float64, width int) string {
@@ -880,56 +982,195 @@ func determineCandidateAction(rule *Rule, isDir bool, uninstallArgs []string, in
 	}
 }
 
-func recoverOrphanedQuarantines(scanDirs []string, out io.Writer) int {
-	recoveredCount := 0
+type QuarantineJournalEntry struct {
+	OpID           string    `json:"op_id"`
+	OriginalPath   string    `json:"original_path"`
+	QuarantinePath string    `json:"quarantine_path"`
+	Phase          string    `json:"phase"`
+	Timestamp      time.Time `json:"timestamp"`
+}
+
+var (
+	journalMutex        sync.Mutex
+	journalPathOverride string
+)
+
+func getJournalPath() string {
+	if journalPathOverride != "" {
+		return journalPathOverride
+	}
+	if env := os.Getenv("UNSLOP_JOURNAL_PATH"); env != "" {
+		return env
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ".unslop-journal.json"
+	}
+	return filepath.Join(home, ".unslop-journal.json")
+}
+
+func loadJournal(jPath string) ([]QuarantineJournalEntry, error) {
+	journalMutex.Lock()
+	defer journalMutex.Unlock()
+
+	data, err := os.ReadFile(jPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []QuarantineJournalEntry{}, nil
+		}
+		return nil, err
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return []QuarantineJournalEntry{}, nil
+	}
+	var entries []QuarantineJournalEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func saveJournal(jPath string, entries []QuarantineJournalEntry) error {
+	journalMutex.Lock()
+	defer journalMutex.Unlock()
+
+	dir := filepath.Dir(jPath)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return err
+		}
+	}
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(jPath, data, 0600)
+}
+
+func recordQuarantineEntry(jPath string, entry QuarantineJournalEntry) error {
+	entries, err := loadJournal(jPath)
+	if err != nil {
+		entries = []QuarantineJournalEntry{}
+	}
+	if entry.Timestamp.IsZero() {
+		entry.Timestamp = time.Now()
+	}
+	updated := false
+	for i, e := range entries {
+		if e.OpID == entry.OpID {
+			entries[i] = entry
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		entries = append(entries, entry)
+	}
+	return saveJournal(jPath, entries)
+}
+
+func updateJournalEntryPhase(jPath string, opID string, phase string) error {
+	entries, err := loadJournal(jPath)
+	if err != nil {
+		return err
+	}
+	for i, e := range entries {
+		if e.OpID == opID {
+			entries[i].Phase = phase
+			return saveJournal(jPath, entries)
+		}
+	}
+	return nil
+}
+
+func removeJournalEntry(jPath string, opID string) error {
+	entries, err := loadJournal(jPath)
+	if err != nil {
+		return err
+	}
+	newEntries := make([]QuarantineJournalEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.OpID != opID {
+			newEntries = append(newEntries, e)
+		}
+	}
+	return saveJournal(jPath, newEntries)
+}
+
+func isPathUnderAny(path string, scanDirs []string) bool {
+	if len(scanDirs) == 0 {
+		return true
+	}
+	pAbs, err := filepath.Abs(path)
+	if err != nil {
+		pAbs = filepath.Clean(path)
+	}
 	for _, root := range scanDirs {
-		p := root
+		r := root
 		if strings.HasPrefix(root, "~") {
 			home, _ := os.UserHomeDir()
 			if home != "" {
-				p = filepath.Join(home, root[1:])
+				r = filepath.Join(home, root[1:])
 			}
 		}
-		if _, err := os.Stat(p); err != nil {
+		rAbs, err := filepath.Abs(r)
+		if err != nil {
+			rAbs = filepath.Clean(r)
+		}
+		if pAbs == rAbs || strings.HasPrefix(pAbs, rAbs+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func recoverOrphanedQuarantines(scanDirs []string, out io.Writer) int {
+	recoveredCount := 0
+	jPath := getJournalPath()
+	entries, err := loadJournal(jPath)
+	if err != nil || len(entries) == 0 {
+		return 0
+	}
+
+	remainingEntries := make([]QuarantineJournalEntry, 0, len(entries))
+	for _, entry := range entries {
+		if len(scanDirs) > 0 && !isPathUnderAny(entry.QuarantinePath, scanDirs) && !isPathUnderAny(entry.OriginalPath, scanDirs) {
+			remainingEntries = append(remainingEntries, entry)
 			continue
 		}
 
-		_ = filepath.WalkDir(p, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
+		if entry.QuarantinePath == "" {
+			continue
+		}
 
-			idx := strings.Index(path, ".unslop-quarantine-")
-			if idx == -1 {
-				return nil
-			}
+		if _, errStat := os.Lstat(entry.QuarantinePath); os.IsNotExist(errStat) {
+			// Quarantine path no longer exists on disk; clean up stale journal entry
+			continue
+		}
 
-			origPath := path[:idx]
-			if origPath == "" {
-				return nil
+		origPath := entry.OriginalPath
+		if origPath == "" {
+			idx := strings.Index(entry.QuarantinePath, ".unslop-quarantine-")
+			if idx != -1 {
+				origPath = entry.QuarantinePath[:idx]
 			}
+		}
 
-			// Restore orphaned quarantine
-			var destPath string
-			if _, errStat := os.Lstat(origPath); os.IsNotExist(errStat) {
-				destPath = origPath
-			} else {
-				destPath = fmt.Sprintf("%s.restored-%d", origPath, time.Now().UnixNano())
-			}
+		if origPath == "" {
+			remainingEntries = append(remainingEntries, entry)
+			continue
+		}
 
-			if errRename := os.Rename(path, destPath); errRename == nil {
-				recoveredCount++
-				fmt.Fprintf(out, "[QUARANTINE RECOVERY] Restored orphaned quarantine '%s' -> '%s'\n", path, destPath)
-			} else {
-				fmt.Fprintf(out, "[QUARANTINE ERROR] Failed to restore orphaned quarantine '%s' -> '%s': %v\n", path, destPath, errRename)
-			}
-
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		})
+		if errRB := rollbackQuarantine(origPath, entry.QuarantinePath, out); errRB == nil {
+			recoveredCount++
+			fmt.Fprintf(out, "[QUARANTINE RECOVERY] Restored orphaned quarantine '%s'\n", entry.QuarantinePath)
+		} else {
+			fmt.Fprintf(out, "[QUARANTINE ERROR] Failed to restore orphaned quarantine '%s': %v\n", entry.QuarantinePath, errRB)
+			remainingEntries = append(remainingEntries, entry)
+		}
 	}
+
+	_ = saveJournal(jPath, remainingEntries)
 	return recoveredCount
 }
 
@@ -1220,6 +1461,28 @@ func findFzf() string {
 	return ""
 }
 
+var reANSI = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(\x07|\x1b\\)`)
+
+func sanitizeTerminalString(s string) string {
+	cleaned := reANSI.ReplaceAllString(s, "")
+	var sb strings.Builder
+	sb.Grow(len(cleaned))
+	for _, r := range cleaned {
+		if r == '\n' {
+			sb.WriteString(`\n`)
+		} else if r == '\r' {
+			sb.WriteString(`\r`)
+		} else if r == '\t' {
+			sb.WriteString(`\t`)
+		} else if r < 0x20 || r == 0x7f {
+			sb.WriteRune('?')
+		} else {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
 func runFzfInteractive(candidates []Candidate, fzfBin string, diskTotal, diskUsed, diskFree uint64) []Candidate {
 	if len(candidates) == 0 {
 		fmt.Fprintf(os.Stderr, "No stale candidates found matching criteria.\n")
@@ -1231,10 +1494,21 @@ func runFzfInteractive(candidates []Candidate, fzfBin string, diskTotal, diskUse
 		totalSizeBytes += c.Size
 	}
 
-	var inputBuf strings.Builder
+	candMap := make(map[string]Candidate, len(candidates))
+	var inputBuf bytes.Buffer
+
 	for _, c := range candidates {
-		line := fmt.Sprintf("[%d] %10s | %4.1fd | %-16s | %s\n", c.ID, formatBytes(c.Size), c.AgeDays, c.Category, c.Path)
-		inputBuf.WriteString(line)
+		token := fmt.Sprintf("cand-%d", c.ID)
+		candMap[token] = c
+
+		sanitizedPath := sanitizeTerminalString(c.Path)
+		sanitizedCategory := sanitizeTerminalString(c.Category)
+		displayLine := fmt.Sprintf("[%d] %10s | %4.1fd | %-16s | %s", c.ID, formatBytes(c.Size), c.AgeDays, sanitizedCategory, sanitizedPath)
+
+		inputBuf.WriteString(token)
+		inputBuf.WriteByte('\t')
+		inputBuf.WriteString(displayLine)
+		inputBuf.WriteByte(0)
 	}
 
 	headerStr := fmt.Sprintf(
@@ -1245,6 +1519,10 @@ func runFzfInteractive(candidates []Candidate, fzfBin string, diskTotal, diskUse
 
 	cmd := exec.Command(fzfBin,
 		"--multi",
+		"--read0",
+		"--print0",
+		"--delimiter=\t",
+		"--with-nth=2..",
 		"--ansi",
 		"--reverse",
 		"--height=80%",
@@ -1252,7 +1530,7 @@ func runFzfInteractive(candidates []Candidate, fzfBin string, diskTotal, diskUse
 		"--prompt=unslop> ",
 	)
 
-	cmd.Stdin = strings.NewReader(inputBuf.String())
+	cmd.Stdin = &inputBuf
 	var outBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = os.Stderr
@@ -1261,28 +1539,23 @@ func runFzfInteractive(candidates []Candidate, fzfBin string, diskTotal, diskUse
 		return nil
 	}
 
-	selectedLines := strings.Split(strings.TrimSpace(outBuf.String()), "\n")
-	if len(selectedLines) == 0 || selectedLines[0] == "" {
+	rawOutput := outBuf.Bytes()
+	if len(rawOutput) == 0 {
 		return nil
 	}
 
-	candMap := make(map[int]Candidate)
-	for _, c := range candidates {
-		candMap[c.ID] = c
-	}
-
+	items := bytes.Split(rawOutput, []byte{0})
 	var selected []Candidate
-	for _, line := range selectedLines {
-		if strings.HasPrefix(line, "[") {
-			endIdx := strings.Index(line, "]")
-			if endIdx > 1 {
-				idStr := line[1:endIdx]
-				if id, err := strconv.Atoi(idStr); err == nil {
-					if cand, ok := candMap[id]; ok {
-						selected = append(selected, cand)
-					}
-				}
-			}
+
+	for _, item := range items {
+		itemStr := strings.TrimSpace(string(item))
+		if itemStr == "" {
+			continue
+		}
+		parts := strings.SplitN(itemStr, "\t", 2)
+		token := parts[0]
+		if cand, ok := candMap[token]; ok {
+			selected = append(selected, cand)
 		}
 	}
 	return selected
@@ -1478,8 +1751,6 @@ func runMain(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 		return 0
 	}
 
-	_ = recoverOrphanedQuarantines(scanDirs, stdout)
-
 	manifest, err := loadManifest(*manifestFlag)
 	if err != nil {
 		fmt.Fprintf(stderr, "[FATAL] %v\n", err)
@@ -1591,9 +1862,167 @@ func (m *multimodFlag) Set(value string) error {
 	return nil
 }
 
-func moveToTrash(path string) error {
-	if err := moveToTrashOS(path); err == nil {
+func pathOrInfoExists(destPath, trashInfoPath, trashInfoDir string) bool {
+	if _, err := os.Lstat(destPath); err == nil {
+		return true
+	}
+	if trashInfoDir != "" {
+		if _, err := os.Lstat(trashInfoPath); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func findUniqueTrashDest(trashFilesDir, trashInfoDir, base string) (string, string, string, string) {
+	ext := filepath.Ext(base)
+	nameNoExt := strings.TrimSuffix(base, ext)
+
+	destName := base
+	destPath := filepath.Join(trashFilesDir, destName)
+	trashInfoName := destName + ".trashinfo"
+	trashInfoPath := filepath.Join(trashInfoDir, trashInfoName)
+
+	if !pathOrInfoExists(destPath, trashInfoPath, trashInfoDir) {
+		return destPath, destName, trashInfoPath, trashInfoName
+	}
+
+	counter := 1
+	now := time.Now()
+	timeStamp := now.Format("20060102_150405")
+	for {
+		if counter == 1 {
+			destName = fmt.Sprintf("%s_%s%s", nameNoExt, timeStamp, ext)
+		} else {
+			destName = fmt.Sprintf("%s_%s_%d%s", nameNoExt, timeStamp, counter, ext)
+		}
+		destPath = filepath.Join(trashFilesDir, destName)
+		trashInfoName = destName + ".trashinfo"
+		trashInfoPath = filepath.Join(trashInfoDir, trashInfoName)
+
+		if !pathOrInfoExists(destPath, trashInfoPath, trashInfoDir) {
+			return destPath, destName, trashInfoPath, trashInfoName
+		}
+		counter++
+	}
+}
+
+func copyFile(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		linkTarget, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(linkTarget, dst)
+	}
+
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+func copyDirTree(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+		return err
+	}
+
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		srcChild := filepath.Join(src, entry.Name())
+		dstChild := filepath.Join(dst, entry.Name())
+
+		if entry.IsDir() {
+			if err := copyDirTree(srcChild, dstChild); err != nil {
+				return err
+			}
+		} else {
+			if err := copyFile(srcChild, dstChild); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func movePath(src, dst string) error {
+	err := os.Rename(src, dst)
+	if err == nil {
 		return nil
+	}
+
+	info, errStat := os.Lstat(src)
+	if errStat != nil {
+		return errStat
+	}
+
+	if info.IsDir() {
+		if errCopy := copyDirTree(src, dst); errCopy != nil {
+			_ = os.RemoveAll(dst)
+			return errCopy
+		}
+		return os.RemoveAll(src)
+	}
+
+	if errCopy := copyFile(src, dst); errCopy != nil {
+		_ = os.Remove(dst)
+		return errCopy
+	}
+	return os.Remove(src)
+}
+
+func moveToTrash(path string, originalPath ...string) error {
+	orig := path
+	if len(originalPath) > 0 && originalPath[0] != "" {
+		orig = originalPath[0]
+	} else {
+		idx := strings.Index(path, ".unslop-quarantine-")
+		if idx != -1 && idx > 0 {
+			orig = path[:idx]
+		}
+	}
+
+	workPath := path
+	if workPath != orig {
+		if _, err := os.Lstat(workPath); err == nil {
+			if _, errOrig := os.Lstat(orig); os.IsNotExist(errOrig) {
+				if errRename := os.Rename(workPath, orig); errRename == nil {
+					workPath = orig
+				}
+			}
+		}
+	}
+
+	if err := moveToTrashOS(workPath); err == nil {
+		if _, errStat := os.Lstat(workPath); os.IsNotExist(errStat) {
+			return nil
+		}
 	}
 
 	home, err := os.UserHomeDir()
@@ -1604,6 +2033,7 @@ func moveToTrash(path string) error {
 	trashInfoDir := filepath.Join(home, ".local", "share", "Trash", "info")
 	if runtime.GOOS == "darwin" {
 		trashFilesDir = filepath.Join(home, ".Trash")
+		trashInfoDir = ""
 	} else {
 		if err := os.MkdirAll(trashInfoDir, 0700); err != nil {
 			return err
@@ -1613,33 +2043,40 @@ func moveToTrash(path string) error {
 		return err
 	}
 
-	absPath, errAbs := filepath.Abs(path)
+	absPath, errAbs := filepath.Abs(orig)
 	if errAbs != nil {
-		absPath = path
+		absPath = orig
 	}
 
-	base := filepath.Base(path)
-	destName := base
-	dest := filepath.Join(trashFilesDir, destName)
-	trashInfoName := destName + ".trashinfo"
+	base := filepath.Base(orig)
+	destPath, _, trashInfoPath, _ := findUniqueTrashDest(trashFilesDir, trashInfoDir, base)
 
-	if _, err := os.Stat(dest); err == nil {
-		ext := filepath.Ext(base)
-		nameNoExt := strings.TrimSuffix(base, ext)
-		timeStamp := time.Now().Format("20060102_150405")
-		destName = fmt.Sprintf("%s_%s%s", nameNoExt, timeStamp, ext)
-		dest = filepath.Join(trashFilesDir, destName)
-		trashInfoName = destName + ".trashinfo"
-	}
-
-	if runtime.GOOS == "linux" {
-		infoPath := filepath.Join(trashInfoDir, trashInfoName)
+	var writtenInfoPath string
+	if runtime.GOOS == "linux" && trashInfoDir != "" {
 		infoContent := fmt.Sprintf("[Trash Info]\nPath=%s\nDeletionDate=%s\n",
 			url.PathEscape(absPath), time.Now().Format("2006-01-02T15:04:05"))
-		_ = os.WriteFile(infoPath, []byte(infoContent), 0600)
+		if err := os.WriteFile(trashInfoPath, []byte(infoContent), 0600); err != nil {
+			return fmt.Errorf("failed to write trashinfo metadata: %w", err)
+		}
+		writtenInfoPath = trashInfoPath
 	}
 
-	return os.Rename(path, dest)
+	if errMove := movePath(workPath, destPath); errMove != nil {
+		if writtenInfoPath != "" {
+			_ = os.Remove(writtenInfoPath)
+		}
+		return fmt.Errorf("failed to move item to trash destination: %w", errMove)
+	}
+
+	if _, errStat := os.Lstat(workPath); !os.IsNotExist(errStat) {
+		_ = os.RemoveAll(destPath)
+		if writtenInfoPath != "" {
+			_ = os.Remove(writtenInfoPath)
+		}
+		return fmt.Errorf("postcondition validation failed: source %s still exists after move to trash", workPath)
+	}
+
+	return nil
 }
 
 func confirmAndDelete(selected []Candidate, dryRun bool, allowData bool, useTrash bool, diskUsed, diskFree uint64) ExecutionResult {
@@ -1786,10 +2223,22 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 
 		case "delete_dir", "delete_file":
 			// Quarantine Architecture: Rename candidate to isolated temporary path before inspection & deletion
-			quarantinePath := fmt.Sprintf("%s.unslop-quarantine-%d-%d", c.Path, c.ID, time.Now().UnixNano())
+			nowNano := time.Now().UnixNano()
+			quarantinePath := fmt.Sprintf("%s.unslop-quarantine-%d-%d", c.Path, c.ID, nowNano)
 			targetPath := c.Path
+			opID := fmt.Sprintf("op-%d-%d", c.ID, nowNano)
+
+			entry := QuarantineJournalEntry{
+				OpID:           opID,
+				OriginalPath:   targetPath,
+				QuarantinePath: quarantinePath,
+				Phase:          "quarantined",
+				Timestamp:      time.Now(),
+			}
+			_ = recordQuarantineEntry(getJournalPath(), entry)
 
 			if errQ := os.Rename(c.Path, quarantinePath); errQ != nil {
+				_ = removeJournalEntry(getJournalPath(), opID)
 				fmt.Fprintf(stdout, " [ABORT] Quarantine isolation failed for %s: %v! Action aborted.\n", targetPath, errQ)
 				res.Aborted++
 				continue
@@ -1798,10 +2247,12 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 			qInfo, errQStat := os.Lstat(quarantinePath)
 			if errQStat != nil || qInfo.IsDir() != c.IsDir {
 				fmt.Fprintf(stdout, " [ABORT] Quarantine inspection failed for %s! Rolling back.\n", targetPath)
-				if errRB := rollbackQuarantine(targetPath, quarantinePath); errRB != nil {
+				if errRB := rollbackQuarantine(targetPath, quarantinePath, stdout); errRB != nil {
+					_ = updateJournalEntryPhase(getJournalPath(), opID, "rollback_failed")
 					fmt.Fprintf(stdout, " [EMERGENCY ERROR] Rollback failed for %s! Quarantined path preserved at %s: %v\n", targetPath, quarantinePath, errRB)
 					res.Failed++
 				} else {
+					_ = removeJournalEntry(getJournalPath(), opID)
 					res.Aborted++
 				}
 				continue
@@ -1816,10 +2267,12 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 					} else {
 						fmt.Fprintf(stdout, " [ABORT] Revalidation traversal failed for quarantined %s: %v! Rolling back.\n", targetPath, errQStats)
 					}
-					if errRB := rollbackQuarantine(targetPath, quarantinePath); errRB != nil {
+					if errRB := rollbackQuarantine(targetPath, quarantinePath, stdout); errRB != nil {
+						_ = updateJournalEntryPhase(getJournalPath(), opID, "rollback_failed")
 						fmt.Fprintf(stdout, " [EMERGENCY ERROR] Rollback failed for %s! Quarantined path preserved at %s: %v\n", targetPath, quarantinePath, errRB)
 						res.Failed++
 					} else {
+						_ = removeJournalEntry(getJournalPath(), opID)
 						res.Aborted++
 					}
 					continue
@@ -1827,10 +2280,12 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 
 				if qFileCount != c.FileCount {
 					fmt.Fprintf(stdout, " [ABORT] File count changed for %s (scanned: %d, quarantined: %d)! Rolling back.\n", targetPath, c.FileCount, qFileCount)
-					if errRB := rollbackQuarantine(targetPath, quarantinePath); errRB != nil {
+					if errRB := rollbackQuarantine(targetPath, quarantinePath, stdout); errRB != nil {
+						_ = updateJournalEntryPhase(getJournalPath(), opID, "rollback_failed")
 						fmt.Fprintf(stdout, " [EMERGENCY ERROR] Rollback failed for %s! Quarantined path preserved at %s: %v\n", targetPath, quarantinePath, errRB)
 						res.Failed++
 					} else {
+						_ = removeJournalEntry(getJournalPath(), opID)
 						res.Aborted++
 					}
 					continue
@@ -1838,10 +2293,12 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 
 				if qSize != c.Size {
 					fmt.Fprintf(stdout, " [ABORT] Subtree size changed for %s (scanned: %d B, quarantined: %d B)! Rolling back.\n", targetPath, c.Size, qSize)
-					if errRB := rollbackQuarantine(targetPath, quarantinePath); errRB != nil {
+					if errRB := rollbackQuarantine(targetPath, quarantinePath, stdout); errRB != nil {
+						_ = updateJournalEntryPhase(getJournalPath(), opID, "rollback_failed")
 						fmt.Fprintf(stdout, " [EMERGENCY ERROR] Rollback failed for %s! Quarantined path preserved at %s: %v\n", targetPath, quarantinePath, errRB)
 						res.Failed++
 					} else {
+						_ = removeJournalEntry(getJournalPath(), opID)
 						res.Aborted++
 					}
 					continue
@@ -1849,10 +2306,12 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 
 				if !c.ModTime.IsZero() && !qMaxModTime.Equal(c.ModTime) {
 					fmt.Fprintf(stdout, " [ABORT] Subtree newest modification time changed for %s! Rolling back.\n", targetPath)
-					if errRB := rollbackQuarantine(targetPath, quarantinePath); errRB != nil {
+					if errRB := rollbackQuarantine(targetPath, quarantinePath, stdout); errRB != nil {
+						_ = updateJournalEntryPhase(getJournalPath(), opID, "rollback_failed")
 						fmt.Fprintf(stdout, " [EMERGENCY ERROR] Rollback failed for %s! Quarantined path preserved at %s: %v\n", targetPath, quarantinePath, errRB)
 						res.Failed++
 					} else {
+						_ = removeJournalEntry(getJournalPath(), opID)
 						res.Aborted++
 					}
 					continue
@@ -1860,18 +2319,39 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 			}
 
 			if useTrash {
-				if errTrash := moveToTrash(quarantinePath); errTrash == nil {
+				_ = updateJournalEntryPhase(getJournalPath(), opID, "deleting")
+				if errTrash := moveToTrash(quarantinePath, targetPath); errTrash == nil {
+					_ = removeJournalEntry(getJournalPath(), opID)
 					res.Completed++
 					res.MovedToTrash += c.Size
 					fmt.Fprintf(stdout, " [TRASHED] %s\n", targetPath)
 				} else {
 					fmt.Fprintf(stdout, " [ERROR] Failed to trash %s: %v\n", targetPath, errTrash)
-					if errRB := rollbackQuarantine(targetPath, quarantinePath); errRB != nil {
+					if errRB := rollbackQuarantine(targetPath, quarantinePath, stdout); errRB != nil {
+						_ = updateJournalEntryPhase(getJournalPath(), opID, "rollback_failed")
 						fmt.Fprintf(stdout, " [EMERGENCY ERROR] Rollback failed for %s! Quarantined path preserved at %s: %v\n", targetPath, quarantinePath, errRB)
+					} else {
+						_ = removeJournalEntry(getJournalPath(), opID)
 					}
 					res.Failed++
 				}
 			} else {
+				if c.IsDir {
+					if hasBoundary, _, bErr := containsMountOrReparsePoint(quarantinePath); hasBoundary {
+						fmt.Fprintf(stdout, " [REFUSED] Permanent deletion refused for %s: %v! Rolling back.\n", targetPath, bErr)
+						if errRB := rollbackQuarantine(targetPath, quarantinePath, stdout); errRB != nil {
+							_ = updateJournalEntryPhase(getJournalPath(), opID, "rollback_failed")
+							fmt.Fprintf(stdout, " [EMERGENCY ERROR] Rollback failed for %s! Quarantined path preserved at %s: %v\n", targetPath, quarantinePath, errRB)
+							res.Failed++
+						} else {
+							_ = removeJournalEntry(getJournalPath(), opID)
+							res.Aborted++
+						}
+						continue
+					}
+				}
+
+				_ = updateJournalEntryPhase(getJournalPath(), opID, "deleting")
 				var errDel error
 				if c.IsDir {
 					errDel = os.RemoveAll(quarantinePath)
@@ -1880,11 +2360,20 @@ func confirmAndDeleteWithIO(selected []Candidate, dryRun bool, allowData bool, u
 				}
 				if errDel != nil {
 					fmt.Fprintf(stdout, " [ERROR] Failed to delete %s: %v\n", targetPath, errDel)
-					if errRB := rollbackQuarantine(targetPath, quarantinePath); errRB != nil {
-						fmt.Fprintf(stdout, " [EMERGENCY ERROR] Rollback failed for %s! Quarantined path preserved at %s: %v\n", targetPath, quarantinePath, errRB)
+					if c.IsDir {
+						_ = updateJournalEntryPhase(getJournalPath(), opID, "partially_deleted")
+						fmt.Fprintf(stdout, " [PARTIAL DELETION ERROR] Permanent deletion failed for %s! Tree was partially deleted and cannot be fully rolled back. Remaining contents preserved at %s\n", targetPath, quarantinePath)
+					} else {
+						if errRB := rollbackQuarantine(targetPath, quarantinePath, stdout); errRB != nil {
+							_ = updateJournalEntryPhase(getJournalPath(), opID, "rollback_failed")
+							fmt.Fprintf(stdout, " [EMERGENCY ERROR] Rollback failed for %s! Quarantined path preserved at %s: %v\n", targetPath, quarantinePath, errRB)
+						} else {
+							_ = removeJournalEntry(getJournalPath(), opID)
+						}
 					}
 					res.Failed++
 				} else {
+					_ = removeJournalEntry(getJournalPath(), opID)
 					res.Completed++
 					res.FreedPermanently += c.Size
 					res.Freed += c.Size

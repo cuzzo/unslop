@@ -40,9 +40,10 @@
       "id": "python_venv",
       "name": "Python Virtual Environment",
       "target": "dir",
-      "patterns": ["venv", ".venv", "env", ".env"],
+      "patterns": ["venv", ".venv", "env"],
       "category": "Python Venv",
       "marker_files": ["pyproject.toml", "requirements.txt", "Pipfile", "setup.py", "environment.yml"],
+      "internal_marker_files": ["pyvenv.cfg"],
       "risk_class": "regenerable"
     },
     {
@@ -88,10 +89,18 @@
       "risk_class": "user-data"
     },
     {
+      "id": "cursor_workspace_storage",
+      "name": "Cursor Workspace Storage",
+      "target": "dir",
+      "patterns": [".config/Cursor/User/workspaceStorage"],
+      "category": "Cursor Workspace Storage",
+      "risk_class": "user-data"
+    },
+    {
       "id": "agent_cache",
       "name": "AI Agent Caches",
       "target": "dir",
-      "patterns": [".codex/cache", ".codex/tmp", ".codex/.tmp", ".claude/cache", ".claude/paste-cache", ".gemini/antigravity-cli/cache", ".gemini/antigravity-cli/implicit", ".config/Cursor/Cache", ".config/Cursor/GPUCache", ".config/Cursor/User/workspaceStorage"],
+      "patterns": [".codex/cache", ".codex/tmp", ".codex/.tmp", ".claude/cache", ".claude/paste-cache", ".gemini/antigravity-cli/cache", ".gemini/antigravity-cli/implicit", ".config/Cursor/Cache", ".config/Cursor/GPUCache"],
       "category": "Agent Cache",
       "risk_class": "regenerable"
     },

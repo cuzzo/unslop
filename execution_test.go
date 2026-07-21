@@ -251,10 +251,36 @@ func TestRollbackQuarantineFailureHandling(t *testing.T) {
 	os.MkdirAll(qDir, 0755)
 	os.WriteFile(filepath.Join(qDir, "file2.txt"), []byte("data2"), 0644)
 
-	// Attempt to rename qDir to origDir when origDir is an occupied directory -> os.Rename returns error!
-	err := rollbackQuarantine(origDir, qDir)
-	if err == nil {
-		t.Errorf("Expected rollbackQuarantine to return error when origDir is occupied")
+	var buf bytes.Buffer
+	// Rollback when original path is occupied must not overwrite origDir, but restore qDir to collision-safe path!
+	err := rollbackQuarantine(origDir, qDir, &buf)
+	if err != nil {
+		t.Errorf("Expected rollbackQuarantine to succeed by restoring to collision-safe path; got err %v", err)
+	}
+
+	// Verify origDir still has its original file1.txt
+	if _, err := os.Stat(filepath.Join(origDir, "file1.txt")); err != nil {
+		t.Errorf("Original occupied directory data was improperly overwritten: %v", err)
+	}
+
+	// Verify qDir was moved to collision-safe restored path with file2.txt intact
+	entries, _ := os.ReadDir(tmpDir)
+	foundRestored := false
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "orig_occupied.restored-") {
+			foundRestored = true
+			restoredFilePath := filepath.Join(tmpDir, e.Name(), "file2.txt")
+			if _, err := os.Stat(restoredFilePath); err != nil {
+				t.Errorf("Restored collision-safe directory missing file2.txt: %v", err)
+			}
+		}
+	}
+	if !foundRestored {
+		t.Errorf("Expected collision-safe restored path in %s", tmpDir)
+	}
+
+	if !strings.Contains(buf.String(), "[ROLLBACK COLLISION]") {
+		t.Errorf("Expected [ROLLBACK COLLISION] message in log; got:\n%s", buf.String())
 	}
 
 	// Test non-existent quarantine path returns nil error
@@ -351,7 +377,14 @@ func TestExecutionFailureReturnsNonZeroExitCode(t *testing.T) {
 
 	// Make directory read-only so deletion/trash fails
 	os.Chmod(roDir, 0555)
-	defer os.Chmod(roDir, 0755)
+	defer func() {
+		_ = filepath.WalkDir(tmpDir, func(p string, d os.DirEntry, err error) error {
+			if err == nil {
+				_ = os.Chmod(p, 0755)
+			}
+			return nil
+		})
+	}()
 
 	var stdout, stderr bytes.Buffer
 	stdin := strings.NewReader("y\n")
@@ -385,9 +418,9 @@ func TestFzfSelectionAbove10kCandidates(t *testing.T) {
 	fzfScript := filepath.Join(fzfBinDir, "fzf")
 	if runtime.GOOS == "windows" {
 		fzfScript += ".bat"
-		os.WriteFile(fzfScript, []byte("@echo off\nfindstr /C:\"[10000]\" /C:\"[10001]\" /C:\"[1000]\"\n"), 0755)
+		os.WriteFile(fzfScript, []byte("@echo off\nfindstr /C:\"cand-1000\t\" /C:\"cand-10000\t\" /C:\"cand-10001\t\"\n"), 0755)
 	} else {
-		script := "#!/bin/sh\nawk '/\\[1000\\]/ || /\\[10000\\]/ || /\\[10001\\]/'\n"
+		script := "#!/bin/sh\nawk -v RS='\\0' -v ORS='\\0' '/cand-1000\\t/ || /cand-10000\\t/ || /cand-10001\\t/'\n"
 		os.WriteFile(fzfScript, []byte(script), 0755)
 	}
 
@@ -416,19 +449,50 @@ func TestFzfSelectionAbove10kCandidates(t *testing.T) {
 
 func TestOrphanedQuarantineRecoveryAndScannerExclusion(t *testing.T) {
 	tmpDir := t.TempDir()
+	journalFile := filepath.Join(tmpDir, "journal.json")
+	t.Setenv("UNSLOP_JOURNAL_PATH", journalFile)
 
-	// 1. Create an orphaned quarantine directory whose original path is missing
+	// 1. Create an orphaned quarantine directory whose original path is missing (journal owned)
 	targetDir := filepath.Join(tmpDir, "target_cache")
 	orphanedDir := targetDir + ".unslop-quarantine-12-1689000000"
 	os.MkdirAll(orphanedDir, 0755)
 	os.WriteFile(filepath.Join(orphanedDir, "saved_data.txt"), []byte("quarantine_data"), 0644)
+	_ = recordQuarantineEntry(journalFile, QuarantineJournalEntry{
+		OpID:           "op-12",
+		OriginalPath:   targetDir,
+		QuarantinePath: orphanedDir,
+		Phase:          "quarantined",
+		Timestamp:      time.Now(),
+	})
 
-	// 2. Create an orphaned quarantine file whose original path ALREADY EXISTS
+	// 2. Create an orphaned quarantine file whose original path ALREADY EXISTS (journal owned)
 	targetFile := filepath.Join(tmpDir, "stale.log")
 	os.WriteFile(targetFile, []byte("new_stale_log"), 0644)
 	orphanedFile := targetFile + ".unslop-quarantine-13-1689000000"
 	os.WriteFile(orphanedFile, []byte("old_quarantined_log"), 0644)
+	_ = recordQuarantineEntry(journalFile, QuarantineJournalEntry{
+		OpID:           "op-13",
+		OriginalPath:   targetFile,
+		QuarantinePath: orphanedFile,
+		Phase:          "quarantined",
+		Timestamp:      time.Now(),
+	})
 
+	// 3. Create an UN-JOURNALED file matching quarantine name pattern
+	unownedFile := filepath.Join(tmpDir, "unowned.log.unslop-quarantine-999")
+	os.WriteFile(unownedFile, []byte("unowned_data"), 0644)
+
+	// Verify ordinary plan-mode scan does NOT mutate any paths or recover quarantines automatically
+	var stdoutScan, stderrScan bytes.Buffer
+	scanCode := runMain([]string{"-path", tmpDir}, &stdoutScan, &stderrScan, strings.NewReader(""))
+	if scanCode != 0 {
+		t.Errorf("Expected runMain plan-mode scan exit code 0; got %d", scanCode)
+	}
+	if _, err := os.Lstat(orphanedDir); os.IsNotExist(err) {
+		t.Errorf("Ordinary read-only scan mutated/restored quarantined directory %s", orphanedDir)
+	}
+
+	// Now run explicit quarantine recovery
 	var buf bytes.Buffer
 	cnt := recoverOrphanedQuarantines([]string{tmpDir}, &buf)
 
@@ -454,6 +518,11 @@ func TestOrphanedQuarantineRecoveryAndScannerExclusion(t *testing.T) {
 		t.Errorf("Expected restored collision-safe file stale.log.restored-* in %s", tmpDir)
 	}
 
+	// Verify un-journaled file was NOT touched/recovered
+	if _, err := os.Stat(unownedFile); os.IsNotExist(err) {
+		t.Errorf("Un-journaled file %s was improperly mutated/recovered", unownedFile)
+	}
+
 	// Test CLI -recover-quarantine flag via runMain
 	var stdout, stderr bytes.Buffer
 	code := runMain([]string{"-recover-quarantine", "-path", tmpDir}, &stdout, &stderr, strings.NewReader(""))
@@ -462,6 +531,49 @@ func TestOrphanedQuarantineRecoveryAndScannerExclusion(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Quarantine recovery completed") {
 		t.Errorf("Expected Quarantine recovery completed message; got:\n%s", stdout.String())
+	}
+}
+
+func TestTransactionJournalOperations(t *testing.T) {
+	tmpDir := t.TempDir()
+	journalFile := filepath.Join(tmpDir, "journal.json")
+
+	entry1 := QuarantineJournalEntry{
+		OpID:           "op-1",
+		OriginalPath:   "/tmp/orig1",
+		QuarantinePath: "/tmp/orig1.unslop-quarantine-1",
+		Phase:          "quarantined",
+		Timestamp:      time.Now(),
+	}
+
+	if err := recordQuarantineEntry(journalFile, entry1); err != nil {
+		t.Fatalf("Failed to record entry: %v", err)
+	}
+
+	entries, err := loadJournal(journalFile)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("Expected 1 journal entry; got %d, err: %v", len(entries), err)
+	}
+	if entries[0].OpID != "op-1" || entries[0].Phase != "quarantined" {
+		t.Errorf("Unexpected entry data: %+v", entries[0])
+	}
+
+	// Update phase
+	if err := updateJournalEntryPhase(journalFile, "op-1", "deleting"); err != nil {
+		t.Fatalf("Failed to update phase: %v", err)
+	}
+	entries, _ = loadJournal(journalFile)
+	if entries[0].Phase != "deleting" {
+		t.Errorf("Expected phase 'deleting'; got '%s'", entries[0].Phase)
+	}
+
+	// Remove entry
+	if err := removeJournalEntry(journalFile, "op-1"); err != nil {
+		t.Fatalf("Failed to remove entry: %v", err)
+	}
+	entries, _ = loadJournal(journalFile)
+	if len(entries) != 0 {
+		t.Errorf("Expected 0 journal entries after removal; got %d", len(entries))
 	}
 }
 
@@ -506,9 +618,16 @@ func TestTrashAccountingAndFreeDesktopMetadataRecord(t *testing.T) {
 		if err != nil || len(entries) == 0 {
 			t.Fatalf("Expected FreeDesktop Trash info file in %s; got err=%v", trashInfoDir, err)
 		}
+		if strings.Contains(entries[0].Name(), ".unslop-quarantine-") {
+			t.Errorf("Trash info filename %s contains quarantine pattern", entries[0].Name())
+		}
 		infoData, _ := os.ReadFile(filepath.Join(trashInfoDir, entries[0].Name()))
-		if !strings.Contains(string(infoData), "[Trash Info]") || !strings.Contains(string(infoData), "Path=") {
-			t.Errorf("Invalid FreeDesktop .trashinfo content:\n%s", string(infoData))
+		infoStr := string(infoData)
+		if !strings.Contains(infoStr, "[Trash Info]") || !strings.Contains(infoStr, "Path=") {
+			t.Errorf("Invalid FreeDesktop .trashinfo content:\n%s", infoStr)
+		}
+		if strings.Contains(infoStr, ".unslop-quarantine-") {
+			t.Errorf("FreeDesktop .trashinfo Path contains quarantine pattern:\n%s", infoStr)
 		}
 	}
 
@@ -537,5 +656,218 @@ func TestTrashAccountingAndFreeDesktopMetadataRecord(t *testing.T) {
 	}
 	if resP.MovedToTrash != 0 {
 		t.Errorf("Expected MovedToTrash == 0 in permanent mode; got %d", resP.MovedToTrash)
+	}
+}
+
+func TestTransactionalTrashFallback(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// 1. Multiple same-second collision resolution
+	file1 := filepath.Join(tmpHome, "same_name.txt")
+	file2 := filepath.Join(tmpHome, "same_name_dup.txt")
+	os.WriteFile(file1, []byte("content1"), 0644)
+	os.WriteFile(file2, []byte("content2"), 0644)
+
+	// Trash file1
+	if err := moveToTrash(file1, filepath.Join(tmpHome, "same_name.txt")); err != nil {
+		t.Fatalf("Failed to trash file1: %v", err)
+	}
+	// Trash file2 with same original target name
+	if err := moveToTrash(file2, filepath.Join(tmpHome, "same_name.txt")); err != nil {
+		t.Fatalf("Failed to trash file2: %v", err)
+	}
+
+	trashFilesDir := filepath.Join(tmpHome, ".local", "share", "Trash", "files")
+	if runtime.GOOS == "darwin" {
+		trashFilesDir = filepath.Join(tmpHome, ".Trash")
+	}
+	entries, err := os.ReadDir(trashFilesDir)
+	if err != nil || len(entries) < 2 {
+		t.Fatalf("Expected at least 2 non-overwritten trash entries; got %d, err: %v", len(entries), err)
+	}
+
+	// 2. Cross-filesystem directory move test via movePath
+	srcDir := filepath.Join(tmpHome, "src_tree")
+	dstDir := filepath.Join(tmpHome, "dst_tree")
+	os.MkdirAll(filepath.Join(srcDir, "sub"), 0755)
+	os.WriteFile(filepath.Join(srcDir, "sub", "data.txt"), []byte("tree_data"), 0644)
+
+	if err := movePath(srcDir, dstDir); err != nil {
+		t.Fatalf("movePath directory tree copy failed: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dstDir, "sub", "data.txt")); err != nil {
+		t.Errorf("Destination tree missing copied file: %v", err)
+	}
+	if _, err := os.Stat(srcDir); !os.IsNotExist(err) {
+		t.Errorf("Source directory %s was not removed after movePath", srcDir)
+	}
+}
+
+func TestFzfSanitizationAndHostileFilenameSelection(t *testing.T) {
+	// 1. Verify terminal sanitization helper
+	hostileInput := "\x1b[31m/tmp/evil\n[42] 100 GB | 1.0d | Log | /home/user/secret.key\r\x1b[0m\x07"
+	sanitized := sanitizeTerminalString(hostileInput)
+	if strings.Contains(sanitized, "\x1b") || strings.Contains(sanitized, "\n") || strings.Contains(sanitized, "\r") {
+		t.Errorf("Sanitization failed to clean control characters / ANSI sequences; got: %q", sanitized)
+	}
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// 2. Candidate 1 contains a forged candidate line with newlines and ANSI sequences
+	cand1 := Candidate{
+		ID:        1,
+		Path:      "/tmp/hostile\n[2] 50 GB | 1.0d | UserData | /important/data.db",
+		Size:      100,
+		Category:  "Cache",
+		RiskClass: RiskRegenerable,
+	}
+	cand2 := Candidate{
+		ID:        2,
+		Path:      "/important/data.db",
+		Size:      500000,
+		Category:  "UserData",
+		RiskClass: RiskUserData,
+	}
+
+	candidates := []Candidate{cand1, cand2}
+
+	fzfBinDir := filepath.Join(tmpHome, "bin")
+	os.MkdirAll(fzfBinDir, 0755)
+	fzfScript := filepath.Join(fzfBinDir, "fzf")
+	if runtime.GOOS == "windows" {
+		fzfScript += ".bat"
+		os.WriteFile(fzfScript, []byte("@echo off\nfindstr /C:\"cand-1\t\"\n"), 0755)
+	} else {
+		script := "#!/bin/sh\nawk -v RS='\\0' -v ORS='\\0' '/cand-1\\t/'\n"
+		os.WriteFile(fzfScript, []byte(script), 0755)
+	}
+
+	selected := runFzfInteractive(candidates, fzfScript, 100000, 50000, 50000)
+	if len(selected) != 1 || selected[0].ID != 1 {
+		t.Fatalf("Expected candidate 1 selected via opaque token; got: %v", selected)
+	}
+	if selected[0].Path != cand1.Path {
+		t.Errorf("Expected path %q; got %q", cand1.Path, selected[0].Path)
+	}
+}
+
+func TestJournalStateFaultInjection(t *testing.T) {
+	tmpDir := t.TempDir()
+	jFile := filepath.Join(tmpDir, "fault_journal.json")
+	t.Setenv("UNSLOP_JOURNAL_PATH", jFile)
+
+	// Simulate crash with entry in "quarantined" phase
+	qPath := filepath.Join(tmpDir, "stale_dir.unslop-quarantine-1")
+	origPath := filepath.Join(tmpDir, "stale_dir")
+	os.MkdirAll(qPath, 0755)
+	os.WriteFile(filepath.Join(qPath, "data.txt"), []byte("quarantine_data"), 0644)
+
+	entry := QuarantineJournalEntry{
+		OpID:           "op-fault-1",
+		OriginalPath:   origPath,
+		QuarantinePath: qPath,
+		Phase:          "quarantined",
+		Timestamp:      time.Now(),
+	}
+	if err := recordQuarantineEntry(jFile, entry); err != nil {
+		t.Fatalf("Failed to record fault entry: %v", err)
+	}
+
+	var out bytes.Buffer
+	recovered := recoverOrphanedQuarantines(nil, &out)
+	if recovered != 1 {
+		t.Errorf("Expected 1 recovered quarantine entry; got %d", recovered)
+	}
+	if _, err := os.Stat(origPath); err != nil {
+		t.Errorf("Expected origPath to be restored; got err: %v", err)
+	}
+
+	// Verify journal entry cleaned up after recovery
+	entries, _ := loadJournal(jFile)
+	if len(entries) != 0 {
+		t.Errorf("Expected journal to be empty after recovery; got %d entries", len(entries))
+	}
+}
+
+func TestMountAndReparsePointRefusal(t *testing.T) {
+	tmpDir := t.TempDir()
+	candDir := filepath.Join(tmpDir, "mount_cand")
+	os.MkdirAll(candDir, 0755)
+	targetFile := filepath.Join(tmpDir, "target_outside.txt")
+	os.WriteFile(targetFile, []byte("outside"), 0644)
+
+	// Create symlink inside candidate directory pointing outside
+	symlinkPath := filepath.Join(candDir, "link_outside")
+	os.Symlink(targetFile, symlinkPath)
+
+	hasBoundary, bPath, err := containsMountOrReparsePoint(candDir)
+	if !hasBoundary {
+		t.Fatalf("Expected containsMountOrReparsePoint to return true for symlink boundary")
+	}
+	if bPath != symlinkPath {
+		t.Errorf("Expected boundary path %s; got %s", symlinkPath, bPath)
+	}
+	if err == nil {
+		t.Errorf("Expected non-nil boundary error")
+	}
+
+	// Verify confirmAndDeleteWithIO refuses permanent deletion when boundary present
+	info, _ := os.Lstat(candDir)
+	qSize, qMaxModTime, qFileCount, _, _ := inspectDirectorySubtree(candDir, time.Now())
+	cand := Candidate{
+		ID:             1,
+		Path:           candDir,
+		Size:           qSize,
+		FileCount:      qFileCount,
+		RiskClass:      RiskRegenerable,
+		CanDelete:      true,
+		ProposedAction: "delete_dir",
+		IsDir:          true,
+		ModTime:        qMaxModTime,
+		RootModTime:    info.ModTime(),
+	}
+
+	var stdout bytes.Buffer
+	res := confirmAndDeleteWithIO([]Candidate{cand}, false, false, false, 1000, 500, &stdout, strings.NewReader("y\n"))
+	if res.Aborted != 1 {
+		t.Errorf("Expected permanent deletion to be aborted for mount/reparse-point boundary; got Aborted=%d", res.Aborted)
+	}
+	if !strings.Contains(stdout.String(), "[REFUSED]") {
+		t.Errorf("Expected [REFUSED] in output log; got:\n%s", stdout.String())
+	}
+}
+
+func TestPythonVenvRuleRequiresPyvenvCfg(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Directory named .env in a Python project must NOT be matched as python_venv
+	envSecretDir := filepath.Join(tmpDir, ".env")
+	os.MkdirAll(envSecretDir, 0755)
+	os.WriteFile(filepath.Join(tmpDir, "pyproject.toml"), []byte("[tool.poetry]"), 0644)
+
+	manifest, _ := loadManifest("manifest.json")
+	engine := NewRuleEngine(manifest)
+
+	rule1, _, _ := engine.MatchDir(".env", envSecretDir, nil)
+	if rule1 != nil && rule1.ID == "python_venv" {
+		t.Errorf("Directory .env should not be matched as python_venv!")
+	}
+
+	// 2. Directory named venv WITHOUT pyvenv.cfg must NOT be matched as python_venv
+	venvNoCfgDir := filepath.Join(tmpDir, "venv")
+	os.MkdirAll(venvNoCfgDir, 0755)
+	rule2, _, _ := engine.MatchDir("venv", venvNoCfgDir, nil)
+	if rule2 != nil && rule2.ID == "python_venv" {
+		t.Errorf("Directory venv without pyvenv.cfg should not be matched as python_venv!")
+	}
+
+	// 3. Directory named venv WITH pyvenv.cfg MUST be matched as python_venv
+	os.WriteFile(filepath.Join(venvNoCfgDir, "pyvenv.cfg"), []byte("home = /usr/bin"), 0644)
+	rule3, _, _ := engine.MatchDir("venv", venvNoCfgDir, nil)
+	if rule3 == nil || rule3.ID != "python_venv" {
+		t.Errorf("Directory venv with pyvenv.cfg must be matched as python_venv!")
 	}
 }
