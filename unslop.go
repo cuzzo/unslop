@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -285,10 +286,40 @@ func loadManifest(path string) Manifest {
 	return getDefaultManifest()
 }
 
+func calculateDynamicMinSizeMB(diskTotalBytes uint64) float64 {
+	const minFloorMB = 0.1 // 100 KB
+	const maxCapMB = 50.0   // 50 MB
+
+	if diskTotalBytes == 0 {
+		return 10.0
+	}
+
+	diskGB := float64(diskTotalBytes) / (1024.0 * 1024.0 * 1024.0)
+
+	var minSizeMB float64
+	if diskGB <= 50.0 {
+		minSizeMB = 1.0
+	} else if diskGB >= 1000.0 {
+		minSizeMB = maxCapMB
+	} else {
+		// Logarithmic interpolation: 50GB -> 1MB, 100GB -> 10MB
+		ratio := math.Log10(diskGB/50.0) / math.Log10(2.0)
+		minSizeMB = 1.0 + ratio*9.0
+	}
+
+	if minSizeMB < minFloorMB {
+		minSizeMB = minFloorMB
+	}
+	if minSizeMB > maxCapMB {
+		minSizeMB = maxCapMB
+	}
+
+	return minSizeMB
+}
+
 func getDefaultManifest() Manifest {
 	return Manifest{
-		DefaultDays:      3.0,
-		DefaultMinSizeMB: 1.0,
+		DefaultDays: 7.0,
 		Rules: []Rule{
 			{ID: "zig_cache", Name: "Zig Build Cache", Target: "dir", Patterns: []string{".zig-cache", "zig-cache", ".clear-cache", "clear-cache", ".clear-transpile-cache"}, Category: "Cache Dir"},
 			{ID: "build_target", Name: "Project Build Targets", Target: "dir", Patterns: []string{"target", ".gradle", ".nuget", ".m2", ".npm", ".rubies", "node_modules/.cache", "kcov", "tmp*", "temp*", "_tmp*", "_temp*", "*.tmp", "*.temp"}, Category: "Cache Dir"},
@@ -604,8 +635,11 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 					if err != nil {
 						return nil
 					}
-					ageDays := now.Sub(info.ModTime()).Hours() / 24.0
 					sz := info.Size()
+					if sz < 100*1024 {
+						return nil
+					}
+					ageDays := now.Sub(info.ModTime()).Hours() / 24.0
 
 					rule, pkgName, uninstallCmd := engine.MatchFile(name, p, info)
 					cat := ""
@@ -793,8 +827,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  unslop -json_artifacts +*.bak\n")
 	}
 
-	daysFlag := flag.Float64("days", 3.0, "Minimum age in days")
-	minSizeFlag := flag.Float64("min-size-mb", 1.0, "Minimum size in MB")
+	daysFlag := flag.Float64("days", 7.0, "Minimum age in days")
+	minSizeFlag := flag.Float64("min-size-mb", 0.0, "Minimum size in MB (default: dynamic disk-scaled)")
 	manifestFlag := flag.String("manifest", "", "Custom manifest JSON path")
 	dryRunFlag := flag.Bool("dry-run", false, "Preview without deleting")
 
@@ -829,19 +863,27 @@ func main() {
 	engine := NewRuleEngine(manifest)
 	applyOverrides(engine, flag.Args())
 
+	diskTotal, diskUsed, diskFree, _ := getDiskSpace("/")
+	dynamicMinSizeMB := calculateDynamicMinSizeMB(diskTotal)
+
 	minDays := *daysFlag
 	if !daysSet && manifest.DefaultDays > 0 {
 		minDays = manifest.DefaultDays
 	}
 
 	minSizeMB := *minSizeFlag
-	if !minSizeSet && manifest.DefaultMinSizeMB > 0 {
-		minSizeMB = manifest.DefaultMinSizeMB
+	if !minSizeSet {
+		if manifest.DefaultMinSizeMB > 0 {
+			minSizeMB = manifest.DefaultMinSizeMB
+		} else {
+			minSizeMB = dynamicMinSizeMB
+		}
+	}
+	if minSizeMB <= 0 {
+		minSizeMB = dynamicMinSizeMB
 	}
 
 	minSizeBytes := int64(minSizeMB * 1024 * 1024)
-
-	diskTotal, diskUsed, diskFree, _ := getDiskSpace("/")
 
 	candidates := scanParallel(scanDirs, engine, minDays, minSizeBytes)
 

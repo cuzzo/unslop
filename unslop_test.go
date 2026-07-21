@@ -37,6 +37,40 @@ func TestFormatUintBytes(t *testing.T) {
 	}
 }
 
+func TestCalculateDynamicMinSizeMB(t *testing.T) {
+	const gb = uint64(1024 * 1024 * 1024)
+
+	// 10 GB -> 1.0 MB
+	sz10 := calculateDynamicMinSizeMB(10 * gb)
+	if sz10 != 1.0 {
+		t.Errorf("10GB disk should yield 1.0 MB; got %.2f", sz10)
+	}
+
+	// 50 GB -> 1.0 MB
+	sz50 := calculateDynamicMinSizeMB(50 * gb)
+	if sz50 != 1.0 {
+		t.Errorf("50GB disk should yield 1.0 MB; got %.2f", sz50)
+	}
+
+	// 100 GB -> 10.0 MB
+	sz100 := calculateDynamicMinSizeMB(100 * gb)
+	if sz100 < 9.9 || sz100 > 10.1 {
+		t.Errorf("100GB disk should yield ~10.0 MB; got %.2f", sz100)
+	}
+
+	// 1000 GB (1TB) -> 50.0 MB
+	sz1000 := calculateDynamicMinSizeMB(1000 * gb)
+	if sz1000 != 50.0 {
+		t.Errorf("1TB disk should yield 50.0 MB cap; got %.2f", sz1000)
+	}
+
+	// Zero disk size -> fallback
+	szZero := calculateDynamicMinSizeMB(0)
+	if szZero != 10.0 {
+		t.Errorf("0 disk size should yield 10.0 MB fallback; got %.2f", szZero)
+	}
+}
+
 func TestFormatNumber(t *testing.T) {
 	if formatNumber(123) != "123" {
 		t.Errorf("formatNumber(123) failed")
