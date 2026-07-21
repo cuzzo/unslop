@@ -164,15 +164,15 @@ func TestLoadManifest(t *testing.T) {
 		t.Errorf("loadManifest fallback failed")
 	}
 
-	// Test ~/.stale-cleaner.json resolution
+	// Test ~/.unslop.json resolution
 	tempHome := t.TempDir()
-	dotPath := filepath.Join(tempHome, ".stale-cleaner.json")
+	dotPath := filepath.Join(tempHome, ".unslop.json")
 	os.WriteFile(dotPath, []byte(content), 0644)
 	t.Setenv("HOME", tempHome)
 
 	mDot := loadManifest("")
 	if len(mDot.Rules) != 1 || mDot.Rules[0].ID != "test_rule" {
-		t.Errorf("loadManifest ~/.stale-cleaner.json failed")
+		t.Errorf("loadManifest ~/.unslop.json failed")
 	}
 }
 
@@ -377,7 +377,7 @@ func TestFlagUsageOutput(t *testing.T) {
 	io.Copy(&buf, r)
 	output := buf.String()
 
-	if !strings.Contains(output, "stale-cleaner") {
+	if !strings.Contains(output, "unslop") {
 		t.Errorf("flag.Usage output missing header")
 	}
 }

@@ -241,9 +241,9 @@ func loadManifest(path string) Manifest {
 
 	home, _ := os.UserHomeDir()
 
-	// Check ~/.stale-cleaner.json in home directory
+	// Check ~/.unslop.json in home directory
 	if home != "" {
-		dotPath := filepath.Join(home, ".stale-cleaner.json")
+		dotPath := filepath.Join(home, ".unslop.json")
 		if data, err := os.ReadFile(dotPath); err == nil {
 			var m Manifest
 			if err := json.Unmarshal(data, &m); err == nil && len(m.Rules) > 0 {
@@ -252,13 +252,13 @@ func loadManifest(path string) Manifest {
 		}
 	}
 
-	// Check XDG config directory (~/.config/stale-cleaner/manifest.json)
+	// Check XDG config directory (~/.config/unslop/manifest.json)
 	configDir := os.Getenv("XDG_CONFIG_HOME")
 	if configDir == "" && home != "" {
 		configDir = filepath.Join(home, ".config")
 	}
 	if configDir != "" {
-		xdgPath := filepath.Join(configDir, "stale-cleaner", "manifest.json")
+		xdgPath := filepath.Join(configDir, "unslop", "manifest.json")
 		if data, err := os.ReadFile(xdgPath); err == nil {
 			var m Manifest
 			if err := json.Unmarshal(data, &m); err == nil && len(m.Rules) > 0 {
@@ -272,7 +272,7 @@ func loadManifest(path string) Manifest {
 		var m Manifest
 		if err := json.Unmarshal(defaultManifestData, &m); err == nil && len(m.Rules) > 0 {
 			if configDir != "" {
-				userConfigPath := filepath.Join(configDir, "stale-cleaner", "manifest.json")
+				userConfigPath := filepath.Join(configDir, "unslop", "manifest.json")
 				_ = os.MkdirAll(filepath.Dir(userConfigPath), 0755)
 				_ = os.WriteFile(userConfigPath, defaultManifestData, 0644)
 			}
@@ -704,7 +704,7 @@ func runFzfInteractive(candidates []Candidate, fzfBin string, diskTotal, diskUse
 		"--ansi",
 		"--bind=space:toggle+down",
 		"--header="+headerStr,
-		"--prompt=StaleCleaner> ",
+		"--prompt=unslop> ",
 		"--preview="+previewCmd,
 		"--preview-window=bottom:4:wrap:border-top",
 		"--height=100%",
@@ -775,18 +775,18 @@ func getDefaultScanDirs() []string {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "stale-cleaner - High-performance interactive developer cache & stale artifact cleaner\n\n")
+		fmt.Fprintf(os.Stderr, "unslop - High-performance interactive developer cache & stale artifact cleaner\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  stale-cleaner [options] [-remove-rule ...] [+custom-pattern ...]\n\n")
+		fmt.Fprintf(os.Stderr, "  unslop [options] [-remove-rule ...] [+custom-pattern ...]\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nManifest Overrides (positional arguments):\n")
 		fmt.Fprintf(os.Stderr, "  -category      Exclude a category or rule ID (e.g. -json_artifacts, -LLM)\n")
 		fmt.Fprintf(os.Stderr, "  +pattern       Add a custom glob pattern to scan (e.g. +*.log, +tmp-*)\n")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  stale-cleaner -days 7 -min-size-mb 10\n")
-		fmt.Fprintf(os.Stderr, "  stale-cleaner -path ~/.cache -path /tmp -dry-run\n")
-		fmt.Fprintf(os.Stderr, "  stale-cleaner -json_artifacts +*.bak\n")
+		fmt.Fprintf(os.Stderr, "  unslop -days 7 -min-size-mb 10\n")
+		fmt.Fprintf(os.Stderr, "  unslop -path ~/.cache -path /tmp -dry-run\n")
+		fmt.Fprintf(os.Stderr, "  unslop -json_artifacts +*.bak\n")
 	}
 
 	daysFlag := flag.Float64("days", 3.0, "Minimum age in days")
