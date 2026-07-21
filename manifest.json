@@ -186,7 +186,7 @@
       "target": "dir",
       "patterns": ["*/.local/share/swiftly/toolchains/*"],
       "category": "UNUSED (Swift)",
-      "risk_class": "package-managed"
+      "risk_class": "regenerable"
     },
     {
       "id": "sdkman_cand",
@@ -194,7 +194,7 @@
       "target": "dir",
       "patterns": ["*/.sdkman/candidates/*/*"],
       "category": "UNUSED (SDKMAN)",
-      "risk_class": "package-managed"
+      "risk_class": "regenerable"
     },
     {
       "id": "dotnet_pkg",
@@ -220,7 +220,7 @@
       "target": "any",
       "patterns": ["*/.zvm/bin/*", "*/.zvm/zig/*"],
       "category": "UNUSED (ZVM)",
-      "risk_class": "package-managed"
+      "risk_class": "regenerable"
     }
   ]
 }
