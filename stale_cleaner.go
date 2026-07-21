@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -15,6 +16,9 @@ import (
 	"syscall"
 	"time"
 )
+
+//go:embed manifest.json
+var defaultManifestData []byte
 
 // Candidate represents a found stale file or directory
 type Candidate struct {
@@ -228,13 +232,27 @@ func matchPattern(name, pattern string) bool {
 func loadManifest(path string) Manifest {
 	if path == "" {
 		home, _ := os.UserHomeDir()
-		path = filepath.Join(home, ".config", "stale-cleaner", "manifest.json")
-	}
-	data, err := os.ReadFile(path)
-	if err == nil {
-		var m Manifest
-		if err := json.Unmarshal(data, &m); err == nil && len(m.Rules) > 0 {
-			return m
+		userConfigPath := filepath.Join(home, ".config", "stale-cleaner", "manifest.json")
+		if data, err := os.ReadFile(userConfigPath); err == nil {
+			var m Manifest
+			if err := json.Unmarshal(data, &m); err == nil && len(m.Rules) > 0 {
+				return m
+			}
+		}
+		if len(defaultManifestData) > 0 {
+			var m Manifest
+			if err := json.Unmarshal(defaultManifestData, &m); err == nil && len(m.Rules) > 0 {
+				_ = os.MkdirAll(filepath.Dir(userConfigPath), 0755)
+				_ = os.WriteFile(userConfigPath, defaultManifestData, 0644)
+				return m
+			}
+		}
+	} else {
+		if data, err := os.ReadFile(path); err == nil {
+			var m Manifest
+			if err := json.Unmarshal(data, &m); err == nil && len(m.Rules) > 0 {
+				return m
+			}
 		}
 	}
 	return getDefaultManifest()
