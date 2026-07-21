@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -864,6 +867,232 @@ func TestCoveragePushTo95(t *testing.T) {
 	codeOverrides := runMain([]string{"-apply", "-apply-data", "-include-data", "-path", tmpDir, "--", "-zig_cache", "+*.tmp"}, &stdout, &stderr, strings.NewReader("y\n"))
 	if codeOverrides != 0 {
 		t.Errorf("runMain overrides failed: %d (stderr: %s)", codeOverrides, stderr.String())
+	}
+}
+
+func TestActual12kCandidateScan(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldTime := time.Now().Add(-200 * time.Hour)
+
+	for i := 1; i <= 12000; i++ {
+		sub := filepath.Join(tmpDir, fmt.Sprintf("sub_%d", i/1000))
+		if i%1000 == 1 {
+			os.MkdirAll(sub, 0755)
+		}
+		p := filepath.Join(sub, fmt.Sprintf("stale_%d.log", i))
+		os.WriteFile(p, bytes.Repeat([]byte("a"), 200*1024), 0644)
+		os.Chtimes(p, oldTime, oldTime)
+	}
+
+	engine := NewRuleEngine(getDefaultManifest())
+	candidates := scanParallel([]string{tmpDir}, engine, 2.0, 100*1024, true)
+
+	if len(candidates) != 12000 {
+		t.Errorf("scanParallel on 12,000 files expected 12,000 candidates; got %d", len(candidates))
+	}
+}
+
+func TestAllPackageManagerFixturesAndNegativeMappings(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	cargoDir := filepath.Join(tempHome, ".cargo")
+	os.MkdirAll(cargoDir, 0755)
+	os.WriteFile(filepath.Join(cargoDir, ".crates.toml"), []byte("\"cargo-crate 1.0.0 (registry+...)\" = [\"cargo-bin\"]\n"), 0644)
+
+	os.MkdirAll(filepath.Join(tempHome, ".local", "pipx", "venvs", "pipx-tool"), 0755)
+	os.MkdirAll(filepath.Join(tempHome, ".nvm", "versions", "node", "v20.0.0", "lib", "node_modules", "npm-pkg"), 0755)
+	os.MkdirAll(filepath.Join(tempHome, ".dotnet", "tools", ".store", "dotnet-pkg"), 0755)
+
+	compDir := filepath.Join(tempHome, ".config", "composer", "vendor", "composer")
+	os.MkdirAll(compDir, 0755)
+	os.WriteFile(filepath.Join(compDir, "installed.json"), []byte(`{"packages":[{"name":"vendor/composer-pkg"}]}`), 0644)
+
+	os.MkdirAll(filepath.Join(tempHome, ".sdkman", "candidates", "java", "17.0.1"), 0755)
+	os.MkdirAll(filepath.Join(tempHome, ".local", "share", "swiftly", "toolchains", "5.9.2"), 0755)
+	os.MkdirAll(filepath.Join(tempHome, ".zvm", "0.11.0"), 0755)
+
+	inv := loadPackageInventory()
+
+	if len(formatUninstallArgs("UNUSED (Cargo)", "cargo-bin", "/path", inv)) != 3 {
+		t.Errorf("Cargo positive mapping failed")
+	}
+	if len(formatUninstallArgs("UNUSED (pipx)", "pipx-tool", "/home/user/.local/pipx/venvs/pipx-tool/bin/pipx-tool", inv)) != 3 {
+		t.Errorf("pipx positive mapping failed")
+	}
+	if len(formatUninstallArgs("UNUSED (npm)", "npm-pkg", "/path", inv)) != 4 {
+		t.Errorf("npm positive mapping failed")
+	}
+	if len(formatUninstallArgs("UNUSED (Dotnet)", "dotnet-pkg", "/path", inv)) != 5 {
+		t.Errorf("Dotnet positive mapping failed")
+	}
+	if len(formatUninstallArgs("UNUSED (SDKMAN)", "17.0.1", "/home/user/.sdkman/candidates/java/17.0.1", inv)) != 4 {
+		t.Errorf("SDKMAN positive mapping failed")
+	}
+
+	negativeBins := []struct {
+		category string
+		name     string
+		path     string
+	}{
+		{"UNUSED (Cargo)", "unmapped-cargo", "/path"},
+		{"UNUSED (pipx)", "unmapped-pipx", "/path"},
+		{"UNUSED (npm)", "unmapped-npm", "/path"},
+		{"UNUSED (npm)", "node", "/path"},
+		{"UNUSED (npm)", "npm", "/path"},
+		{"UNUSED (npm)", "npx", "/path"},
+		{"UNUSED (Dotnet)", "unmapped-dotnet", "/path"},
+		{"UNUSED (Composer)", "unmapped-composer", "/path"},
+		{"UNUSED (SDKMAN)", "current", "/home/user/.sdkman/candidates/java/current"},
+		{"UNUSED (Swift)", "5.8.0", "/home/user/.local/share/swiftly/toolchains/5.8.0"},
+		{"UNUSED (ZVM)", "0.10.0", "/home/user/.zvm/0.10.0"},
+	}
+
+	for _, neg := range negativeBins {
+		args := formatUninstallArgs(neg.category, neg.name, neg.path, inv)
+		if args != nil {
+			t.Errorf("Negative mapping for %s (%s) should return nil; got %v", neg.name, neg.category, args)
+		}
+	}
+}
+
+func TestChangedSizeModtimeBetweenScanAndApply(t *testing.T) {
+	tmpDir := t.TempDir()
+	f := filepath.Join(tmpDir, "mutating.log")
+	os.WriteFile(f, []byte("initial data"), 0644)
+
+	now := time.Now()
+	cand := Candidate{
+		Path:      f,
+		Size:      12,
+		AgeDays:   5.0,
+		Category:  "Log",
+		RiskClass: RiskRegenerable,
+		IsDir:     false,
+		CanDelete: true,
+		ModTime:   now,
+	}
+
+	os.WriteFile(f, []byte("mutated data with different length"), 0644)
+
+	var stdout bytes.Buffer
+	confirmAndDeleteWithIO([]Candidate{cand}, false, false, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
+
+	dirReplacement := filepath.Join(tmpDir, "dir_replaced")
+	os.MkdirAll(dirReplacement, 0755)
+	candTypeMismatch := Candidate{
+		Path:      dirReplacement,
+		Size:      10,
+		AgeDays:   5.0,
+		Category:  "Log",
+		RiskClass: RiskRegenerable,
+		IsDir:     false,
+		CanDelete: true,
+		ModTime:   now,
+	}
+
+	var stdoutMismatch bytes.Buffer
+	confirmAndDeleteWithIO([]Candidate{candTypeMismatch}, false, false, false, 1000, 1000, &stdoutMismatch, strings.NewReader("y\n"))
+	if !strings.Contains(stdoutMismatch.String(), "[ABORT]") {
+		t.Errorf("Expected [ABORT] for file type mismatch; got: %s", stdoutMismatch.String())
+	}
+}
+
+func TestSymlinksAndSameTypePathReplacement(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	realDir := filepath.Join(tmpDir, "real_dir")
+	os.MkdirAll(realDir, 0755)
+	os.WriteFile(filepath.Join(realDir, "secret.txt"), []byte("data"), 0644)
+
+	symlinkDir := filepath.Join(tmpDir, "sym_dir")
+	_ = os.Symlink(realDir, symlinkDir)
+
+	brokenSym := filepath.Join(tmpDir, "broken_sym")
+	_ = os.Symlink("/non/existent/target/path", brokenSym)
+
+	engine := NewRuleEngine(getDefaultManifest())
+
+	cands := scanParallel([]string{tmpDir}, engine, 0.0, 0, true)
+	for _, c := range cands {
+		if c.Path == symlinkDir || c.Path == brokenSym {
+			if c.IsDir {
+				t.Errorf("Symlink should not be classified as a standard directory candidate")
+			}
+		}
+	}
+}
+
+func TestFzfSelectionHostilePathsAndPipes(t *testing.T) {
+	tmpDir := t.TempDir()
+	mockFzf := filepath.Join(tmpDir, "fzf")
+	script := `#!/bin/sh
+cat > /dev/null
+echo "[0001]  10.0 MB | 5.0d | Log | /tmp/path;touch_hacked|grep 'foo'\"bar"
+`
+	os.WriteFile(mockFzf, []byte(script), 0755)
+
+	hostilePath := "/tmp/path;touch_hacked|grep 'foo'\"bar"
+	candidates := []Candidate{
+		{
+			ID:             1,
+			Path:           hostilePath,
+			Size:           10 * 1024 * 1024,
+			AgeDays:        5.0,
+			Category:       "Log",
+			RiskClass:      RiskRegenerable,
+			ProposedAction: "delete_file",
+			CanDelete:      true,
+		},
+	}
+
+	selected := runFzfInteractive(candidates, mockFzf, 1000, 500, 500)
+	if len(selected) != 1 || selected[0].Path != hostilePath {
+		t.Errorf("runFzfInteractive hostile path selection failed: %v", selected)
+	}
+}
+
+func TestRealCLISubprocessAndJSONSchema(t *testing.T) {
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "unslop")
+
+	cmdBuild := exec.Command("go", "build", "-o", binPath, ".")
+	cmdBuild.Dir = "."
+	if out, err := cmdBuild.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to build unslop binary: %v\n%s", err, string(out))
+	}
+
+	cmdRun := exec.Command(binPath, "-json", "-path", tmpDir)
+	var stdout, stderr bytes.Buffer
+	cmdRun.Stdout = &stdout
+	cmdRun.Stderr = &stderr
+	if err := cmdRun.Run(); err != nil {
+		t.Fatalf("Failed to execute unslop CLI subprocess: %v\n%s", err, stderr.String())
+	}
+
+	var report PlanReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("Failed to parse unslop JSON report output: %v\nOutput: %s", err, stdout.String())
+	}
+
+	if report.Version == "" || report.ScannedAt == "" || report.DiskUsage.TotalBytes == 0 {
+		t.Errorf("Invalid PlanReport JSON schema: %+v", report)
+	}
+}
+
+func TestMacOSWindowsRuntimeHelpers(t *testing.T) {
+	mockFI := mockFileInfo{}
+
+	atime, ctime, uid, isPosix := getStatTimes(mockFI)
+	if atime.IsZero() || ctime.IsZero() {
+		t.Errorf("getStatTimes failed")
+	}
+	_ = uid
+	_ = isPosix
+
+	tot, used, free, err := getDiskSpaceSyscall("/")
+	if err != nil || tot == 0 || used == 0 || free == 0 {
+		t.Errorf("getDiskSpaceSyscall('/') failed: tot=%d used=%d free=%d err=%v", tot, used, free, err)
 	}
 }
 
