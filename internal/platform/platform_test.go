@@ -1,4 +1,4 @@
-package main
+package platform
 
 import (
 	"os"
@@ -15,7 +15,6 @@ func TestHermeticPlatformTrashAdapters(t *testing.T) {
 	testFile := filepath.Join(tmpDir, "test_item.tmp")
 	os.WriteFile(testFile, []byte("data"), 0644)
 
-	// Mock injected command environment
 	binDir := filepath.Join(tmpHome, "bin")
 	os.MkdirAll(binDir, 0755)
 
@@ -60,8 +59,32 @@ func TestMoveToTrashOSFallbackWhenNoUtility(t *testing.T) {
 	tmpFile := filepath.Join(t.TempDir(), "fallback.tmp")
 	os.WriteFile(tmpFile, []byte("data"), 0644)
 
-	// moveToTrashOS returns error when no OS trash binary is in PATH
 	if err := moveToTrashOS(tmpFile); err == nil {
 		t.Errorf("Expected moveToTrashOS to return error when PATH is empty")
+	}
+}
+
+func TestContainsMountOrReparsePointFailsClosedOnUninspectableSubtree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Chmod 0000 permission test is POSIX specific")
+	}
+
+	tmpDir := t.TempDir()
+	subDir := filepath.Join(tmpDir, "restricted_dir")
+	os.MkdirAll(subDir, 0755)
+
+	unreadableChild := filepath.Join(subDir, "secret_child")
+	os.MkdirAll(unreadableChild, 0700)
+	os.WriteFile(filepath.Join(unreadableChild, "data.bin"), []byte("SECRET"), 0600)
+
+	os.Chmod(unreadableChild, 0000)
+	defer os.Chmod(unreadableChild, 0700)
+
+	hasBoundary, _, err := ContainsMountOrReparsePoint(subDir)
+	if !hasBoundary {
+		t.Errorf("FAIL-CLOSED VIOLATION: Expected ContainsMountOrReparsePoint to return hasBoundary=true on uninspectable subtree; got false")
+	}
+	if err == nil {
+		t.Errorf("Expected ContainsMountOrReparsePoint to return an inspection error on unreadable subtree")
 	}
 }

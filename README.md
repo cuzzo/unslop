@@ -1,10 +1,6 @@
-# unslop (Experimental Read-Only Alpha v0.2.0)
+# unslop
 
-> **What**: `unslop` is an experimental, conservative developer-workstation hygiene planner that analyzes build caches, toolchain artifacts, AI agent logs, and model weights across your system.
-> **Why**: Use it to inspect, explain, and plan disk reclamation across developer tools and AI workflows with explicit risk classification, structured package provenance, JSON plan export, and multi-layered safety guards.
-
-> [!IMPORTANT]
-> `unslop` is currently in **Experimental Read-Only Alpha**. It defaults to plan and report mode. Deletion mode requires explicit `--apply` opt-in.
+`unslop` is a high-performance developer workstation hygiene utility. It scans build caches, toolchain artifacts, package stores, AI agent logs, and model weights across your system, allowing you to interactively review and safely reclaim disk space.
 
 ---
 
@@ -13,88 +9,124 @@
 Install via standard Go tooling:
 
 ```bash
-go install github.com/yahn/unslop@latest
+go install github.com/yahn/unslop/cmd/unslop@latest
 ```
 
 ### Dependencies
 - **Go**: Version 1.22+
-- **FZF (Optional)**: `fzf` for interactive terminal UI filtering. If `fzf` is absent, `unslop` outputs a clean, structured text plan report.
+- **fzf (Recommended)**: `fzf` for interactive terminal UI filtering and selection. If `fzf` is not installed, `unslop` renders a structured text summary.
 
 ---
 
-## Risk Classes
-
-`unslop` categorizes all candidates into explicit risk levels:
-
-1. **`regenerable`** *(Safe)*: Build artifacts and compiler outputs (`.zig-cache`, `target/`, `.gradle`, `node_modules/.cache`) that can be transparently recreated by build tools.
-2. **`package-managed`** *(Toolchain)*: Binaries mapped directly to native package inventories (`cargo`, `pipx`, `npm`, `swiftly`, `sdkman`, `dotnet`, `composer`) that execute native package uninstallation.
-3. **`user-data`** *(Review-Only / Opt-In)*: Local LLM model weights, AI agent conversation histories, logs, and large JSON dumps. **Excluded by default unless `--include-data` is specified.**
-4. **`unknown`** *(Report-Only / Custom)*: Custom user-defined patterns (`+pattern`) and unverified binary paths. **Never automatically deleted in `-apply` mode.**
-
----
-
-## Usage & Commands
+## Usage
 
 ```bash
-# Run in default Read-Only Plan Mode (scans safe regenerable caches)
+# Interactively scan system for stale candidates (opens fzf TUI if available)
 unslop
 
-# Export structured JSON plan report
-unslop -json -plan-out plan.json
-
-# Include user data, AI agent sessions, and LLM weights for review
-unslop -include-data
-
-# Custom age window (e.g. 14 days) and minimum size (e.g. 10 MB)
-unslop -days 14 -min-size-mb 10
-
-# Move candidates to System Trash (Trash mode is enabled by default)
+# Execute deletion / staging on selected items (moves to System Trash by default)
 unslop -apply
 
-# Perform permanent deletion without Trash (bypasses system Trash)
+# Preview scan results without modifying files
+unslop -dry-run
+
+# Override inactivity threshold (e.g. 14 days) and minimum size (e.g. 50 MB)
+unslop -days 14 -min-size-mb 50
+
+# Load a custom rules manifest file
+unslop -manifest ~/.config/unslop/manifest.json
+
+# Opt-in to scan and delete user-data directories (e.g. LLM model weights, agent histories)
+unslop -include-data -apply-data
+
+# Perform permanent deletion bypassing the system Trash
 unslop -apply -force-permanent
 ```
 
 ---
 
-## Structured JSON Plan Output (`-json` / `-plan-out`)
+## Manifest Configuration
+
+`unslop` uses a JSON manifest to define scanning rules, risk classifications, and default thresholds.
+
+### Manifest File Locations
+`unslop` checks for a manifest file in the following order:
+1. Custom manifest passed via `-manifest /path/to/manifest.json`
+2. `~/.unslop.json`
+3. `~/.config/unslop/manifest.json` (or `$XDG_CONFIG_HOME/unslop/manifest.json`)
+4. Embedded default `manifest.json`
+
+### Extending the Manifest
+
+You can customize `~/.config/unslop/manifest.json` to add custom target folders and files, tag them for display in the interactive UI, and adjust default thresholds:
 
 ```json
 {
-  "version": "0.2.0-alpha",
-  "scanned_at": "2026-07-21T14:35:00Z",
-  "disk_usage": {
-    "total_bytes": 1073741824000,
-    "used_bytes": 429496729600,
-    "free_bytes": 644245094400
-  },
-  "total_candidates": 1,
-  "total_size_bytes": 125829120,
-  "candidates": [
+  "version": 1,
+  "default_days": 7.0,
+  "default_min_size_mb": 10.0,
+  "rules": [
     {
-      "id": 1,
-      "path": "/home/user/.cache/zig",
-      "size_bytes": 125829120,
-      "age_days": 14.2,
-      "category": "Cache Dir",
-      "rule_id": "zig_cache",
+      "id": "my_custom_cache",
+      "name": "My Custom Build Cache",
+      "target": "dir",
+      "patterns": [".my-cache", "tmp-build-*"],
+      "category": "Custom Cache",
       "risk_class": "regenerable",
-      "reason": "Stale build cache unused for 14.2 days",
-      "evidence": "Last modified 14.2 days ago, total size 120.0 MB across 45 files",
-      "proposed_action": "delete_dir",
-      "is_dir": true,
-      "file_count": 45
+      "min_size_mb": 5.0
+    },
+    {
+      "id": "custom_log_files",
+      "name": "App Debug Logs",
+      "target": "file",
+      "patterns": ["*.log", "debug-*.txt"],
+      "category": "Log Files",
+      "risk_class": "regenerable",
+      "min_size_mb": 1.0
     }
   ]
 }
 ```
 
+### Manifest Fields Reference
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `version` | `int` | Manifest schema version (currently `1`). |
+| `default_days` | `float` | Default inactivity threshold in days. Overridden by CLI flag `-days`. |
+| `default_min_size_mb` | `float` | Default minimum candidate size in MB. Overridden by CLI flag `-min-size-mb`. |
+| `rules` | `array` | List of rule definitions for directory and file matching. |
+
+#### Rule Definition Fields
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `id` | `string` | Unique identifier for the rule (e.g. `"cargo_target"`). |
+| `name` | `string` | Human-readable name displayed in summary and logs. |
+| `target` | `string` | Target type: `"dir"`, `"file"`, or `"any"`. |
+| `patterns` | `array` | Glob patterns to match directory or file names (e.g. `["node_modules", ".cache"]`). |
+| `category` | `string` | Display label shown in the TUI (e.g. `"Node Modules"`, `"Rust Target"`). |
+| `risk_class` | `string` | Risk classification (`"regenerable"`, `"package-managed"`, `"user-data"`, `"unknown"`). |
+| `marker_files` | `array` | *(Optional)* Parent directory marker files required for rule to match (e.g. `["Cargo.toml"]`). |
+| `internal_marker_files` | `array` | *(Optional)* Internal directory marker files required inside candidate (e.g. `["package.json"]`). |
+| `min_size_mb` | `float` | *(Optional)* Rule-specific minimum size override in MB. |
+
+---
+
+## Risk Classes
+
+Every rule specifies a `risk_class` that governs safety and deletion behavior in the UI:
+
+1. **`regenerable`** *(Safe for Deletion)*: Build artifacts and compiler outputs (`.zig-cache`, `target/`, `node_modules`) that can be recreated by build tools.
+2. **`package-managed`** *(Toolchain)*: System toolchain directories mapped to package managers (`cargo`, `pipx`, `npm`, `swiftly`, `sdkman`, `dotnet`, `zvm`). Classified as report-only unless explicitly uninstalled.
+3. **`user-data`** *(Opt-In Only)*: LLM model weights, agent session histories, and data dumps. Excluded unless `-include-data` and `-apply-data` are supplied.
+4. **`unknown`** *(Report-Only)*: Unclassified patterns. Always isolated as report-only.
+
 ---
 
 ## Safety Architecture
 
-- **Single-Pass High Performance Scan**: Fast parallel filesystem traversal without double scanning.
-- **Fail-Closed Subtree Protection Guard**: Traverses candidate subtrees and fails closed on unreadable or permission-restricted subdirectories to prevent deleting protected credential, configuration, or agent memory files.
-- **Fail-Closed Pre-Action Fingerprint Revalidation**: Revalidates candidate file size (`size_bytes`), modification time (`ModTime`), file item type (`IsDir`), and path existence directly before execution. Aborts deletion if any attribute mutated since the scan snapshot.
-- **Unknown / Custom Pattern Report-Only Isolation**: Custom user patterns added via `+pattern` are classified as `unknown` risk class and are strictly report-only (`CanDelete = false`). They are never deleted automatically in `--apply` mode.
-- **Injection-Safe Parameterized Trash Handlers**: Employs parameterized command invocation on Windows (`powershell -LiteralPath`) and macOS (`osascript argv`) to prevent shell injection or path escaping.
+- **Single-Pass Parallel Traversal**: High-speed parallel filesystem crawler with real-time status output.
+- **Fail-Closed Subtree Guard**: Aborts directory deletion if unreadable permissions or protected agent credentials/keys are found inside.
+- **Pre-Action Fingerprint Revalidation**: Checks file sizes and modification timestamps right before deletion to ensure data has not changed since the scan snapshot.
+- **Transactional Trash Quarantine**: Moves items into isolated quarantine before deletion or recycling.

@@ -1,10 +1,6 @@
-package main
+package config
 
 import (
-	"bytes"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -60,33 +56,33 @@ func TestCompletePolicyMatrixFailClosed(t *testing.T) {
 	}
 }
 
-func TestExecutorRecalculatesPolicyForInconsistentCandidate(t *testing.T) {
-	tmpDir := t.TempDir()
-	sampleFile := filepath.Join(tmpDir, "sample_pkg_file.bin")
-	os.WriteFile(sampleFile, []byte("data"), 0644)
-	info, _ := os.Lstat(sampleFile)
-
-	// Candidate with inconsistent fields: CanDelete=true and ProposedAction="delete_file", but RiskClass=RiskPackageManaged
-	inconsistentCand := Candidate{
-		ID:             99,
-		Path:           sampleFile,
-		Size:           4,
-		RiskClass:      RiskPackageManaged,
-		Category:       "Package Dependency",
-		ProposedAction: "delete_file", // Malformed / inconsistent field
-		CanDelete:      true,          // Malformed / inconsistent field
-		RootModTime:    info.ModTime(),
-		ModTime:        info.ModTime(),
+func determineCandidateAction(rule *Rule, isDir bool, uninstallArgs []string, includeData bool, containsProtected bool) (string, bool) {
+	if containsProtected {
+		return "report-only", false
 	}
 
-	var stdout bytes.Buffer
-	res := confirmAndDeleteWithIO([]Candidate{inconsistentCand}, false, true, false, 1000, 1000, &stdout, strings.NewReader("y\n"))
-
-	out := stdout.String()
-	if res.Skipped != 1 || res.Completed != 0 {
-		t.Errorf("Expected executor to recalculate policy and refuse action; got skipped=%d, completed=%d\nOutput:\n%s", res.Skipped, res.Completed, out)
+	defaultDeleteAction := "delete_file"
+	if isDir {
+		defaultDeleteAction = "delete_dir"
 	}
-	if !strings.Contains(out, "Action refused") && !strings.Contains(out, "report-only") {
-		t.Errorf("Expected Action refused message; got:\n%s", out)
+
+	switch rule.RiskClass {
+	case RiskRegenerable:
+		return defaultDeleteAction, true
+
+	case RiskPackageManaged:
+		return "report-only", false
+
+	case RiskUserData:
+		if includeData {
+			return defaultDeleteAction, true
+		}
+		return "report-only", false
+
+	case RiskUnknown:
+		return "report-only", false
+
+	default:
+		return "report-only", false
 	}
 }

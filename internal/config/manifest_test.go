@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"os"
@@ -7,7 +7,6 @@ import (
 )
 
 func TestManifestMigrationLegacyToV1(t *testing.T) {
-	// Legacy manifest JSON without "version" and without "risk_class"
 	legacyJSON := `{
 		"rules": [
 			{"id": "legacy_rule_1", "name": "Legacy 1", "target": "dir", "patterns": [".cargo"], "category": "UNUSED (Cargo)"},
@@ -22,7 +21,7 @@ func TestManifestMigrationLegacyToV1(t *testing.T) {
 		t.Fatalf("Failed to write legacy manifest: %v", err)
 	}
 
-	m, err := loadManifest(manifestPath)
+	m, err := LoadManifest(manifestPath)
 	if err != nil {
 		t.Fatalf("Failed to load and migrate legacy manifest: %v", err)
 	}
@@ -31,7 +30,6 @@ func TestManifestMigrationLegacyToV1(t *testing.T) {
 		t.Errorf("Expected manifest Version to be migrated to 1; got %d", m.Version)
 	}
 
-	// Missing risk_class MUST safely migrate to RiskUnknown with diagnostic warning
 	for _, r := range m.Rules {
 		if r.RiskClass != RiskUnknown {
 			t.Errorf("Expected missing risk_class in legacy rule '%s' to migrate to RiskUnknown; got %s", r.ID, r.RiskClass)
@@ -117,9 +115,9 @@ func TestManifestValidationErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			p := filepath.Join(tmpDir, "manifest_"+tt.name+".json")
 			os.WriteFile(p, []byte(tt.json), 0644)
-			_, err := loadManifest(p)
+			_, err := LoadManifest(p)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("%s: loadManifest() error = %v, wantErr %v", tt.name, err, tt.wantErr)
+				t.Errorf("%s: LoadManifest() error = %v, wantErr %v", tt.name, err, tt.wantErr)
 			}
 		})
 	}
