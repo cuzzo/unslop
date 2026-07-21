@@ -1216,72 +1216,6 @@ func countFilesInSubtree(dirPath string) int64 {
 	return count
 }
 
-func countTotalFiles(topLevelPaths []string, engine *RuleEngine, pkgInventory *PackageInventory) int64 {
-	var total int64
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 16)
-	currentUID := uint32(os.Getuid())
-
-	for _, r := range topLevelPaths {
-		wg.Add(1)
-		go func(root string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			isTmp := root == "/tmp" || strings.HasPrefix(root, "/tmp/")
-
-			_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-				if err != nil {
-					return nil
-				}
-				name := d.Name()
-				if strings.Contains(name, ".unslop-quarantine-") {
-					if d.IsDir() {
-						atomic.AddInt64(&total, countFilesInSubtree(p))
-						return filepath.SkipDir
-					}
-					return nil
-				}
-				if isProtected(p) {
-					if d.IsDir() {
-						atomic.AddInt64(&total, countFilesInSubtree(p))
-						return filepath.SkipDir
-					}
-					return nil
-				}
-				if d.IsDir() && (name == ".git" || name == ".hg" || name == ".svn") {
-					atomic.AddInt64(&total, countFilesInSubtree(p))
-					return filepath.SkipDir
-				}
-				if isTmp {
-					if info, err := d.Info(); err == nil {
-						_, _, uid, isPosix := getStatTimes(info)
-						if isPosix && uid != currentUID {
-							if d.IsDir() {
-								atomic.AddInt64(&total, countFilesInSubtree(p))
-								return filepath.SkipDir
-							}
-							return nil
-						}
-					}
-				}
-				atomic.AddInt64(&total, 1)
-
-				if d.IsDir() {
-					if rule, _, _ := engine.MatchDir(name, p, pkgInventory); rule != nil {
-						atomic.AddInt64(&total, countFilesInSubtree(p)-1)
-						return filepath.SkipDir
-					}
-				}
-				return nil
-			})
-		}(r)
-	}
-	wg.Wait()
-	return total
-}
-
 func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSizeBytes int64, includeData bool) []Candidate {
 	pkgInventory := loadPackageInventory()
 
@@ -1317,8 +1251,6 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 		}
 	}
 
-	totalFiles := countTotalFiles(topLevelPaths, engine, pkgInventory)
-
 	var walkWg sync.WaitGroup
 	currentUID := uint32(os.Getuid())
 
@@ -1332,6 +1264,9 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 	now := time.Now()
 	startTime := now
 
+	var completedRoots int64
+	totalRoots := int64(len(topLevelPaths))
+
 	doneProgress := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
@@ -1342,23 +1277,15 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 				sFiles := atomic.LoadInt64(&scannedFiles)
 				cBytes := atomic.LoadInt64(&candidateBytes)
 				cCount := atomic.LoadInt64(&candidateCount)
-				finalTotal := totalFiles
-				if sFiles > finalTotal {
-					finalTotal = sFiles
-				}
 				bar := renderProgressBar(100.0, 20)
-				fmt.Fprintf(os.Stderr, "\r\033[KScanning %s 100%% | %s / %s files | Candidates: %d (%s)\n",
-					bar, formatNumber(finalTotal), formatNumber(finalTotal), cCount, formatBytes(cBytes))
+				fmt.Fprintf(os.Stderr, "\r\033[KScanning %s 100%% | %s files | Candidates: %d (%s)\n",
+					bar, formatNumber(sFiles), cCount, formatBytes(cBytes))
 				return
 			case <-ticker.C:
 				sFiles := atomic.LoadInt64(&scannedFiles)
 				cBytes := atomic.LoadInt64(&candidateBytes)
 				cCount := atomic.LoadInt64(&candidateCount)
-
-				finalTotal := totalFiles
-				if sFiles > finalTotal {
-					finalTotal = sFiles
-				}
+				cRoots := atomic.LoadInt64(&completedRoots)
 
 				elapsedSec := time.Since(startTime).Seconds()
 				filesPerSec := 0.0
@@ -1367,16 +1294,16 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 				}
 
 				pct := 0.0
-				if finalTotal > 0 {
-					pct = (float64(sFiles) / float64(finalTotal)) * 100.0
+				if totalRoots > 0 {
+					pct = (float64(cRoots) / float64(totalRoots)) * 95.0
 				}
-				if pct > 99.0 {
-					pct = 99.0
+				if pct > 95.0 {
+					pct = 95.0
 				}
 				bar := renderProgressBar(pct, 20)
 
-				fmt.Fprintf(os.Stderr, "\r\033[KScanning %s %3.0f%% | %s / %s files (%.0f/s) | Candidates: %d (%s)",
-					bar, pct, formatNumber(sFiles), formatNumber(finalTotal), filesPerSec, cCount, formatBytes(cBytes))
+				fmt.Fprintf(os.Stderr, "\r\033[KScanning %s %3.0f%% | %s files (%.0f/s) | Candidates: %d (%s)",
+					bar, pct, formatNumber(sFiles), filesPerSec, cCount, formatBytes(cBytes))
 			}
 		}
 	}()
@@ -1387,6 +1314,7 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 		walkWg.Add(1)
 		go func(r string) {
 			defer walkWg.Done()
+			defer atomic.AddInt64(&completedRoots, 1)
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
@@ -1440,8 +1368,6 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 						}
 					}
 				}
-
-				atomic.AddInt64(&scannedFiles, 1)
 
 				if d.IsDir() {
 					rule, pkgName, uninstallArgs := engine.MatchDir(name, p, pkgInventory)
@@ -1499,7 +1425,11 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 							return filepath.SkipDir
 						}
 					}
-				} else if !d.IsDir() {
+				}
+
+				atomic.AddInt64(&scannedFiles, 1)
+
+				if !d.IsDir() {
 					if isPackageRegistryInternalPath(p) {
 						return nil
 					}
