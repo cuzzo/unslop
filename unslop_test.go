@@ -875,10 +875,8 @@ func TestActual12kCandidateScan(t *testing.T) {
 	oldTime := time.Now().Add(-200 * time.Hour)
 
 	for i := 1; i <= 12000; i++ {
-		sub := filepath.Join(tmpDir, fmt.Sprintf("sub_%d", i/1000))
-		if i%1000 == 1 {
-			os.MkdirAll(sub, 0755)
-		}
+		sub := filepath.Join(tmpDir, fmt.Sprintf("sub_%d", (i-1)/1000))
+		os.MkdirAll(sub, 0755)
 		p := filepath.Join(sub, fmt.Sprintf("stale_%d.log", i))
 		os.WriteFile(p, bytes.Repeat([]byte("a"), 200*1024), 0644)
 		os.Chtimes(p, oldTime, oldTime)
