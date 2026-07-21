@@ -827,6 +827,9 @@ func loadManifest(customPath string) (Manifest, error) {
 		} else if !r.RiskClass.IsValid() {
 			return Manifest{}, fmt.Errorf("invalid risk_class '%s' in rule '%s'", r.RiskClass, r.ID)
 		}
+		if (r.ID == "swift_toolchain" || r.ID == "sdkman_cand" || r.ID == "zvm_toolchain") && r.RiskClass == RiskPackageManaged {
+			r.RiskClass = RiskRegenerable
+		}
 	}
 
 	if m.Version == 0 {
