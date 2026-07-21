@@ -104,4 +104,5 @@ unslop -apply
 
 ## License
 
-[MIT License](LICENSE)
+[BSD 3-Clause License](LICENSE.txt)
+
