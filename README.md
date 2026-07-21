@@ -5,12 +5,22 @@
 
 ---
 
+## Installation
+
+Install via standard Go tooling:
+
+```bash
+go install github.com/yahn/stale-cleaner@latest
+```
+
+---
+
 ## Features
 
 - **Full-Width TUI with Live Inspection**: Select items using `SPACE` or `TAB` with a compact bottom preview window displaying file metadata and line previews.
 - **Declarative Rule Engine**: Configured via a simple JSON manifest to scan build caches (`.zig-cache`, `target/`), LLM weights (`.gguf`, `.safetensors`), AI agent sessions (`Codex`, `Claude`, `Gemini`, `Cursor`), and unused package binaries.
 - **Native Uninstallation**: Automatically delegates removal of unused packages to native toolchains (`cargo uninstall`, `npm uninstall -g`, `pipx uninstall`, `swiftly uninstall`, etc.).
-- **Live System Stats**: Displays real-time disk usage, candidate counts, and accumulated space savings.
+- **Live System Stats & Exact Progress**: Displays real-time disk usage, exact file progress percentage, scanning throughput (`files/s`), and accumulated candidate space in GB.
 - **Safeguards**: Protected path rules ensure credentials, active project configurations, and agent memories are never touched.
 
 ---
@@ -33,11 +43,16 @@ stale-cleaner -json_artifacts +*.bak
 
 ---
 
-## Extending with Custom Manifests
+## Configuration & Custom Manifest Hierarchy
 
-`stale-cleaner` uses a declarative JSON manifest located at `~/.config/stale-cleaner/manifest.json`. You can easily add new scan rules, target types (`dir`, `file`, `any`), categories, and native uninstall commands without recompiling.
+`stale-cleaner` resolves configuration automatically using the following order of precedence:
 
-### Example `~/.config/stale-cleaner/manifest.json`
+1. **Explicit CLI Flag**: `-manifest /path/to/custom.json`
+2. **User Home Override**: `~/.stale-cleaner.json` (Easily override rules from your home folder)
+3. **XDG Config Directory**: `~/.config/stale-cleaner/manifest.json` (or `$XDG_CONFIG_HOME`)
+4. **Embedded Default Binary Manifest**: Embedded at compile time via `//go:embed` (Auto-creates `~/.config/stale-cleaner/manifest.json` on first run if no config exists).
+
+### Example Custom Manifest (`~/.stale-cleaner.json`)
 
 ```json
 {

@@ -163,6 +163,17 @@ func TestLoadManifest(t *testing.T) {
 	if len(mDefault.Rules) == 0 {
 		t.Errorf("loadManifest fallback failed")
 	}
+
+	// Test ~/.stale-cleaner.json resolution
+	tempHome := t.TempDir()
+	dotPath := filepath.Join(tempHome, ".stale-cleaner.json")
+	os.WriteFile(dotPath, []byte(content), 0644)
+	t.Setenv("HOME", tempHome)
+
+	mDot := loadManifest("")
+	if len(mDot.Rules) != 1 || mDot.Rules[0].ID != "test_rule" {
+		t.Errorf("loadManifest ~/.stale-cleaner.json failed")
+	}
 }
 
 func TestMultimodFlag(t *testing.T) {

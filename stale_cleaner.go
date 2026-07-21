@@ -230,24 +230,7 @@ func matchPattern(name, pattern string) bool {
 }
 
 func loadManifest(path string) Manifest {
-	if path == "" {
-		home, _ := os.UserHomeDir()
-		userConfigPath := filepath.Join(home, ".config", "stale-cleaner", "manifest.json")
-		if data, err := os.ReadFile(userConfigPath); err == nil {
-			var m Manifest
-			if err := json.Unmarshal(data, &m); err == nil && len(m.Rules) > 0 {
-				return m
-			}
-		}
-		if len(defaultManifestData) > 0 {
-			var m Manifest
-			if err := json.Unmarshal(defaultManifestData, &m); err == nil && len(m.Rules) > 0 {
-				_ = os.MkdirAll(filepath.Dir(userConfigPath), 0755)
-				_ = os.WriteFile(userConfigPath, defaultManifestData, 0644)
-				return m
-			}
-		}
-	} else {
+	if path != "" {
 		if data, err := os.ReadFile(path); err == nil {
 			var m Manifest
 			if err := json.Unmarshal(data, &m); err == nil && len(m.Rules) > 0 {
@@ -255,6 +238,48 @@ func loadManifest(path string) Manifest {
 			}
 		}
 	}
+
+	home, _ := os.UserHomeDir()
+
+	// Check ~/.stale-cleaner.json in home directory
+	if home != "" {
+		dotPath := filepath.Join(home, ".stale-cleaner.json")
+		if data, err := os.ReadFile(dotPath); err == nil {
+			var m Manifest
+			if err := json.Unmarshal(data, &m); err == nil && len(m.Rules) > 0 {
+				return m
+			}
+		}
+	}
+
+	// Check XDG config directory (~/.config/stale-cleaner/manifest.json)
+	configDir := os.Getenv("XDG_CONFIG_HOME")
+	if configDir == "" && home != "" {
+		configDir = filepath.Join(home, ".config")
+	}
+	if configDir != "" {
+		xdgPath := filepath.Join(configDir, "stale-cleaner", "manifest.json")
+		if data, err := os.ReadFile(xdgPath); err == nil {
+			var m Manifest
+			if err := json.Unmarshal(data, &m); err == nil && len(m.Rules) > 0 {
+				return m
+			}
+		}
+	}
+
+	// Fallback to embedded default manifest
+	if len(defaultManifestData) > 0 {
+		var m Manifest
+		if err := json.Unmarshal(defaultManifestData, &m); err == nil && len(m.Rules) > 0 {
+			if configDir != "" {
+				userConfigPath := filepath.Join(configDir, "stale-cleaner", "manifest.json")
+				_ = os.MkdirAll(filepath.Dir(userConfigPath), 0755)
+				_ = os.WriteFile(userConfigPath, defaultManifestData, 0644)
+			}
+			return m
+		}
+	}
+
 	return getDefaultManifest()
 }
 
