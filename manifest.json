@@ -1,4 +1,6 @@
 {
+  "default_days": 3.0,
+  "default_min_size_mb": 1.0,
   "rules": [
     {
       "id": "zig_cache",

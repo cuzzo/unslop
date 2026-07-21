@@ -46,7 +46,9 @@ type Rule struct {
 
 // Manifest defines the top-level manifest file structure
 type Manifest struct {
-	Rules []Rule `json:"rules"`
+	DefaultDays      float64 `json:"default_days,omitempty"`
+	DefaultMinSizeMB float64 `json:"default_min_size_mb,omitempty"`
+	Rules            []Rule  `json:"rules"`
 }
 
 // RuleEngine manages O(1) and compiled rule lookups
@@ -285,6 +287,8 @@ func loadManifest(path string) Manifest {
 
 func getDefaultManifest() Manifest {
 	return Manifest{
+		DefaultDays:      3.0,
+		DefaultMinSizeMB: 1.0,
 		Rules: []Rule{
 			{ID: "zig_cache", Name: "Zig Build Cache", Target: "dir", Patterns: []string{".zig-cache", "zig-cache", ".clear-cache", "clear-cache", ".clear-transpile-cache"}, Category: "Cache Dir"},
 			{ID: "build_target", Name: "Project Build Targets", Target: "dir", Patterns: []string{"target", ".gradle", ".nuget", ".m2", ".npm", ".rubies", "node_modules/.cache", "kcov", "tmp*", "temp*", "_tmp*", "_temp*", "*.tmp", "*.temp"}, Category: "Cache Dir"},
@@ -799,6 +803,17 @@ func main() {
 
 	flag.Parse()
 
+	daysSet := false
+	minSizeSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "days" {
+			daysSet = true
+		}
+		if f.Name == "min-size-mb" {
+			minSizeSet = true
+		}
+	})
+
 	fzfBin := findFzf()
 	if fzfBin == "" {
 		fmt.Fprintln(os.Stderr, "Error: fzf binary not found.")
@@ -814,11 +829,21 @@ func main() {
 	engine := NewRuleEngine(manifest)
 	applyOverrides(engine, flag.Args())
 
-	minSizeBytes := int64(*minSizeFlag * 1024 * 1024)
+	minDays := *daysFlag
+	if !daysSet && manifest.DefaultDays > 0 {
+		minDays = manifest.DefaultDays
+	}
+
+	minSizeMB := *minSizeFlag
+	if !minSizeSet && manifest.DefaultMinSizeMB > 0 {
+		minSizeMB = manifest.DefaultMinSizeMB
+	}
+
+	minSizeBytes := int64(minSizeMB * 1024 * 1024)
 
 	diskTotal, diskUsed, diskFree, _ := getDiskSpace("/")
 
-	candidates := scanParallel(scanDirs, engine, *daysFlag, minSizeBytes)
+	candidates := scanParallel(scanDirs, engine, minDays, minSizeBytes)
 
 	selected := runFzfInteractive(candidates, fzfBin, diskTotal, diskUsed, diskFree)
 	confirmAndDelete(selected, *dryRunFlag, diskUsed, diskFree)
