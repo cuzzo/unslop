@@ -1216,7 +1216,7 @@ func countFilesInSubtree(dirPath string) int64 {
 	return count
 }
 
-func countTotalFiles(topLevelPaths []string) int64 {
+func countTotalFiles(topLevelPaths []string, engine *RuleEngine, pkgInventory *PackageInventory) int64 {
 	var total int64
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 16)
@@ -1238,17 +1238,20 @@ func countTotalFiles(topLevelPaths []string) int64 {
 				name := d.Name()
 				if strings.Contains(name, ".unslop-quarantine-") {
 					if d.IsDir() {
+						atomic.AddInt64(&total, countFilesInSubtree(p))
 						return filepath.SkipDir
 					}
 					return nil
 				}
 				if isProtected(p) {
 					if d.IsDir() {
+						atomic.AddInt64(&total, countFilesInSubtree(p))
 						return filepath.SkipDir
 					}
 					return nil
 				}
 				if d.IsDir() && (name == ".git" || name == ".hg" || name == ".svn") {
+					atomic.AddInt64(&total, countFilesInSubtree(p))
 					return filepath.SkipDir
 				}
 				if isTmp {
@@ -1256,6 +1259,7 @@ func countTotalFiles(topLevelPaths []string) int64 {
 						_, _, uid, isPosix := getStatTimes(info)
 						if isPosix && uid != currentUID {
 							if d.IsDir() {
+								atomic.AddInt64(&total, countFilesInSubtree(p))
 								return filepath.SkipDir
 							}
 							return nil
@@ -1263,6 +1267,13 @@ func countTotalFiles(topLevelPaths []string) int64 {
 					}
 				}
 				atomic.AddInt64(&total, 1)
+
+				if d.IsDir() {
+					if rule, _, _ := engine.MatchDir(name, p, pkgInventory); rule != nil {
+						atomic.AddInt64(&total, countFilesInSubtree(p)-1)
+						return filepath.SkipDir
+					}
+				}
 				return nil
 			})
 		}(r)
@@ -1306,7 +1317,7 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 		}
 	}
 
-	totalFiles := countTotalFiles(topLevelPaths)
+	totalFiles := countTotalFiles(topLevelPaths, engine, pkgInventory)
 
 	var walkWg sync.WaitGroup
 	currentUID := uint32(os.Getuid())
@@ -1331,14 +1342,23 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 				sFiles := atomic.LoadInt64(&scannedFiles)
 				cBytes := atomic.LoadInt64(&candidateBytes)
 				cCount := atomic.LoadInt64(&candidateCount)
+				finalTotal := totalFiles
+				if sFiles > finalTotal {
+					finalTotal = sFiles
+				}
 				bar := renderProgressBar(100.0, 20)
 				fmt.Fprintf(os.Stderr, "\r\033[KScanning %s 100%% | %s / %s files | Candidates: %d (%s)\n",
-					bar, formatNumber(sFiles), formatNumber(totalFiles), cCount, formatBytes(cBytes))
+					bar, formatNumber(finalTotal), formatNumber(finalTotal), cCount, formatBytes(cBytes))
 				return
 			case <-ticker.C:
 				sFiles := atomic.LoadInt64(&scannedFiles)
 				cBytes := atomic.LoadInt64(&candidateBytes)
 				cCount := atomic.LoadInt64(&candidateCount)
+
+				finalTotal := totalFiles
+				if sFiles > finalTotal {
+					finalTotal = sFiles
+				}
 
 				elapsedSec := time.Since(startTime).Seconds()
 				filesPerSec := 0.0
@@ -1347,8 +1367,8 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 				}
 
 				pct := 0.0
-				if totalFiles > 0 {
-					pct = (float64(sFiles) / float64(totalFiles)) * 100.0
+				if finalTotal > 0 {
+					pct = (float64(sFiles) / float64(finalTotal)) * 100.0
 				}
 				if pct > 99.0 {
 					pct = 99.0
@@ -1356,7 +1376,7 @@ func scanParallel(scanDirs []string, engine *RuleEngine, minDays float64, minSiz
 				bar := renderProgressBar(pct, 20)
 
 				fmt.Fprintf(os.Stderr, "\r\033[KScanning %s %3.0f%% | %s / %s files (%.0f/s) | Candidates: %d (%s)",
-					bar, pct, formatNumber(sFiles), formatNumber(totalFiles), filesPerSec, cCount, formatBytes(cBytes))
+					bar, pct, formatNumber(sFiles), formatNumber(finalTotal), filesPerSec, cCount, formatBytes(cBytes))
 			}
 		}
 	}()
