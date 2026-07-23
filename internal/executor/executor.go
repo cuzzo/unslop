@@ -430,9 +430,16 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 				kind = "DIR "
 			}
 			abbrevPath := format.AbbreviateHomePath(c.Path)
-			pathTag := abbrevPath
+			var tags []string
 			if c.IsGitIgnored {
-				pathTag = "[GITIGNORE] " + abbrevPath
+				tags = append(tags, "[GITIGNORE]")
+			}
+			if c.IsDevBinary {
+				tags = append(tags, "[DEV BINARY]")
+			}
+			pathTag := abbrevPath
+			if len(tags) > 0 {
+				pathTag = strings.Join(tags, " ") + " " + abbrevPath
 			}
 			statusTag := ""
 			if c.RiskClass == config.RiskUserData {
@@ -461,6 +468,9 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 			tags = append(tags, "[CANNOT DELETE]")
 			if c.IsGitIgnored {
 				tags = append(tags, "[GITIGNORE]")
+			}
+			if c.IsDevBinary {
+				tags = append(tags, "[DEV BINARY]")
 			}
 			pathStr := strings.Join(tags, " ") + " " + abbrevPath
 			fmt.Fprintf(stdout, " [%s: %-13s | RISK: %-16s] %10s | %s old | %s [REPORT-ONLY]\n", kind, c.Category, c.RiskClass, ui.FormatBytes(c.Size), format.FormatAgeDays(c.AgeDays), pathStr)

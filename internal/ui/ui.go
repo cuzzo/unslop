@@ -100,6 +100,9 @@ func RunFzfInteractive(candidates []scanner.Candidate, fzfBin string, diskTotal,
 		if c.IsGitIgnored {
 			tags = append(tags, "[GITIGNORE]")
 		}
+		if c.IsDevBinary {
+			tags = append(tags, "[DEV BINARY]")
+		}
 
 		pathWithTags := abbrevPath
 		if len(tags) > 0 {

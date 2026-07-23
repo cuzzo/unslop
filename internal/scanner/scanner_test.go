@@ -314,3 +314,47 @@ func TestScanParallelMaxDaysAgeFiltering(t *testing.T) {
 		t.Errorf("Expected bracket candidate to be %s; got %s", dir50, candBracket[0].Path)
 	}
 }
+
+func TestIsExecutableBinaryAndDevBinaryHighlight(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	exeFile := filepath.Join(tmpDir, "test.exe")
+	if err := os.WriteFile(exeFile, []byte("MZdummy"), 0755); err != nil {
+		t.Fatalf("Failed to write exe file: %v", err)
+	}
+	info, err := os.Stat(exeFile)
+	if err != nil {
+		t.Fatalf("Failed to stat exe file: %v", err)
+	}
+
+	if !IsExecutableBinary(exeFile, info) {
+		t.Errorf("Expected IsExecutableBinary to return true for test.exe")
+	}
+
+	elfFile := filepath.Join(tmpDir, "mybinary")
+	if err := os.WriteFile(elfFile, []byte("\x7fELFbin"), 0755); err != nil {
+		t.Fatalf("Failed to write elf file: %v", err)
+	}
+	elfInfo, err := os.Stat(elfFile)
+	if err != nil {
+		t.Fatalf("Failed to stat elf file: %v", err)
+	}
+
+	if !IsExecutableBinary(elfFile, elfInfo) {
+		t.Errorf("Expected IsExecutableBinary to return true for ELF binary mybinary")
+	}
+
+	scriptFile := filepath.Join(tmpDir, "script.sh")
+	if err := os.WriteFile(scriptFile, []byte("#!/bin/bash\necho 123"), 0755); err != nil {
+		t.Fatalf("Failed to write script file: %v", err)
+	}
+	scriptInfo, err := os.Stat(scriptFile)
+	if err != nil {
+		t.Fatalf("Failed to stat script file: %v", err)
+	}
+
+	if IsExecutableBinary(scriptFile, scriptInfo) {
+		t.Errorf("Expected IsExecutableBinary to return false for shell script")
+	}
+}
+

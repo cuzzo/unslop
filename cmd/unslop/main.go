@@ -36,6 +36,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 
 	daysFlag := flags.Float64("days", 7.0, "Minimum inactivity days to qualify as unslop candidate")
+	minDaysFlag := flags.Float64("min-days", 7.0, "Minimum inactivity days to qualify as unslop candidate")
 	maxDaysFlag := flags.Float64("max-days", 0.0, "Maximum inactivity age in days (0 or negative for unlimited)")
 	minSizeFlag := flags.Float64("min-size-mb", 0.0, "Minimum candidate size in MB")
 	manifestFlag := flags.String("manifest", "", "Custom path to unslop manifest JSON")
@@ -53,6 +54,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	knownFlagsWithValue := map[string]bool{
 		"days":        true,
+		"min-days":    true,
 		"max-days":    true,
 		"min-size-mb": true,
 		"manifest":    true,
@@ -115,8 +117,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	if *daysFlag < 0 {
-		fmt.Fprintf(stderr, "Error: -days cannot be negative\n")
+	if *daysFlag < 0 || *minDaysFlag < 0 {
+		fmt.Fprintf(stderr, "Error: -min-days cannot be negative\n")
 		return 2
 	}
 
@@ -131,10 +133,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	daysSet := false
+	minDaysSet := false
 	minSizeSet := false
 	flags.Visit(func(f *flag.Flag) {
 		if f.Name == "days" {
 			daysSet = true
+		}
+		if f.Name == "min-days" {
+			minDaysSet = true
 		}
 		if f.Name == "min-size-mb" {
 			minSizeSet = true
@@ -173,7 +179,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	dynamicMinSizeMB := config.CalculateDynamicMinSizeMB(diskTotal)
 
 	minDays := *daysFlag
-	if !daysSet && manifest.DefaultDays > 0 {
+	if minDaysSet {
+		minDays = *minDaysFlag
+	} else if daysSet {
+		minDays = *daysFlag
+	} else if manifest.DefaultDays > 0 {
 		minDays = manifest.DefaultDays
 	}
 
@@ -213,6 +223,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			}
 			if c.IsGitIgnored {
 				tags = append(tags, "[GITIGNORE]")
+			}
+			if c.IsDevBinary {
+				tags = append(tags, "[DEV BINARY]")
 			}
 			pathStr := abbrevPath
 			if len(tags) > 0 {

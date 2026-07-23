@@ -3,6 +3,14 @@
   "default_min_size_mb": 0.0,
   "rules": [
     {
+      "id": "dev_binaries",
+      "name": "Development Binaries",
+      "target": "any",
+      "patterns": ["*.exe", "*.out", "a.out", "*.dylib", "*.so", "*.dll", "*.o", "*.a", "*.elf"],
+      "category": "Dev Binary",
+      "risk_class": "regenerable"
+    },
+    {
       "id": "zig_cache",
       "name": "Zig Build Cache",
       "target": "dir",

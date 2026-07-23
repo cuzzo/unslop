@@ -37,6 +37,7 @@ type Candidate struct {
 	InodeNum       uint64           `json:"inode_num,omitempty"`
 	HasIdentity    bool             `json:"has_identity,omitempty"`
 	IsGitIgnored   bool             `json:"is_gitignore,omitempty"`
+	IsDevBinary    bool             `json:"is_dev_binary,omitempty"`
 }
 
 type PackageInventory struct {
@@ -282,6 +283,61 @@ func GetEffectiveItemTime(info os.FileInfo) time.Time {
 	return mtime
 }
 
+func IsExecutableBinary(path string, info os.FileInfo) bool {
+	if info.IsDir() {
+		return false
+	}
+
+	name := strings.ToLower(info.Name())
+	ext := filepath.Ext(name)
+
+	switch ext {
+	case ".exe", ".out", ".dylib", ".so", ".dll", ".o", ".a", ".elf":
+		return true
+	}
+	if name == "a.out" {
+		return true
+	}
+
+	if info.Mode()&0111 != 0 {
+		f, err := os.Open(path)
+		if err != nil {
+			return false
+		}
+		defer f.Close()
+
+		buf := make([]byte, 4)
+		n, err := f.Read(buf)
+		if err != nil || n < 2 {
+			return false
+		}
+
+		if buf[0] == '#' && buf[1] == '!' {
+			return false
+		}
+
+		if n >= 4 && buf[0] == 0x7f && buf[1] == 'E' && buf[2] == 'L' && buf[3] == 'F' {
+			return true
+		}
+		if n >= 4 {
+			if (buf[0] == 0xfe && buf[1] == 0xed && buf[2] == 0xfa && (buf[3] == 0xce || buf[3] == 0xcf)) ||
+				(buf[0] == 0xce && buf[1] == 0xfa && buf[2] == 0xed && buf[3] == 0xfe) ||
+				(buf[0] == 0xcf && buf[1] == 0xfa && buf[2] == 0xed && buf[3] == 0xfe) ||
+				(buf[0] == 0xca && buf[1] == 0xfe && buf[2] == 0xba && buf[3] == 0xbe) {
+				return true
+			}
+		}
+		if buf[0] == 'M' && buf[1] == 'Z' {
+			return true
+		}
+		if n >= 4 && buf[0] == 0x00 && buf[1] == 'a' && buf[2] == 's' && buf[3] == 'm' {
+			return true
+		}
+	}
+
+	return false
+}
+
 func inspectDirectorySubtree(dirPath string, now time.Time) (size int64, maxModTime time.Time, fileCount int64, hasProtected bool, err error) {
 	fi, errLstat := os.Lstat(dirPath)
 	if errLstat != nil {
@@ -525,6 +581,7 @@ func ScanParallel(scanDirs []string, engine *config.RuleEngine, minDays float64,
 								InodeNum:       inoNum,
 								HasIdentity:    hasId,
 								IsGitIgnored:   checkPathIgnored(p),
+								IsDevBinary:    rule.ID == "dev_binaries" || rule.Category == "Dev Binary" || rule.Category == "Development Binary",
 							}
 
 							candMu.Lock()
@@ -602,6 +659,7 @@ func ScanParallel(scanDirs []string, engine *config.RuleEngine, minDays float64,
 								InodeNum:       inoNum,
 								HasIdentity:    hasId,
 								IsGitIgnored:   checkPathIgnored(p),
+								IsDevBinary:    rule.ID == "dev_binaries" || rule.Category == "Dev Binary" || rule.Category == "Development Binary" || IsExecutableBinary(p, info),
 							}
 
 							candMu.Lock()

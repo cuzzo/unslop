@@ -30,8 +30,8 @@ unslop -apply
 # Preview scan results without modifying files
 unslop -dry-run
 
-# Override inactivity threshold (e.g. 14 days) and minimum size (e.g. 50 MB)
-unslop -days 14 -min-size-mb 50
+# Override minimum inactivity threshold (e.g. 14 days) and minimum size (e.g. 50 MB)
+unslop -min-days 14 -min-size-mb 50
 
 # Load a custom rules manifest file
 unslop -manifest ~/.config/unslop/manifest.json
@@ -93,7 +93,7 @@ You can customize `~/.config/unslop/manifest.json` to add custom target folders 
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `version` | `int` | Manifest schema version (currently `1`). |
-| `default_days` | `float` | Default inactivity threshold in days. Overridden by CLI flag `-days`. |
+| `default_days` | `float` | Default inactivity threshold in days. Overridden by CLI flag `-min-days` (or `-days`). |
 | `default_min_size_mb` | `float` | Default minimum candidate size in MB. Overridden by CLI flag `-min-size-mb`. |
 | `rules` | `array` | List of rule definitions for directory and file matching. |
 

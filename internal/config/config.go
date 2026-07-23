@@ -13,6 +13,7 @@ import (
 //go:embed manifest.json
 var defaultManifestData []byte
 
+// Version is the unslop application release version.
 const Version = "0.2.0-alpha"
 
 type RiskClass string
