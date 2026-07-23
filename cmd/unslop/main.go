@@ -32,6 +32,10 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "repo" {
+		return runRepoSubcommand(args[1:], stdin, stdout, stderr)
+	}
+
 	flags := flag.NewFlagSet("unslop", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
