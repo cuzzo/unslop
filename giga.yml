@@ -161,3 +161,41 @@ producers:
         path: .giga/artifacts/nil-kill.sarif
         scope: static
         complete: false
+
+# ── Review: drives the evidence-aware diff verdict + the precommit/premerge
+# MCP review tools. Defaults are sane; this makes the intent explicit and turns
+# on the newer features (project graph, per-stage test depth, check gates).
+review:
+  # T3 findings stay visible but carry no ranking/gating weight.
+  metrics:
+    "T3": { policy: deprioritize, weight: 0.0 }
+  # Escalate a change to CRITICAL on uncovered new tier-1 lines or an
+  # unverified hazard on added lines (the two default gates, made explicit).
+  gates:
+    - id: uncovered-tier1
+      when: { tier: 1, on: added, coverage: uncovered }
+      severity: critical
+    - id: unverified-hazard
+      when: { hazard: any, verified: false }
+      severity: critical
+  report:
+    group_by: tier
+    max_findings_per_tier: 25
+  # Per-stage test depth. precommit = fast coverage (`ci`); premerge also runs
+  # the static analyzers (`analyse`). No Go mutation runner, so mutation stays off.
+  tests:
+    precommit: { profiles: [ci], mutation: false }
+    premerge:  { profiles: [ci, analyse], mutation: false }
+  # Project graph: cmd depends on internal, so an internal/ change runs both.
+  # `go test ./...` covers the whole module, so producers dedupe to gotest.
+  checks_enabled: false          # opt-in; `giga test --checks` runs gofmt gates
+  packages:
+    core:
+      paths: [internal/**]
+      producers: [gotest]
+      checks: [contrib:fmt:go]
+    cli:
+      paths: [cmd/**, unslop.go, main.go]
+      depends_on: [core]
+      producers: [gotest]
+      checks: [contrib:fmt:go]
