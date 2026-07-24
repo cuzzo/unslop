@@ -1,0 +1,64 @@
+version: 1
+profiles:
+  # `giga check` runs Go's test suite with coverage and ingests it so the diff
+  # shows real covered / uncovered lines. fact-mine hazard SARIF is produced by
+  # `giga sync` (the built-in analyse profile) separately.
+  ci:
+    producers: [gotest]
+    required_evidence: [coverage]
+producers:
+  gotest:
+    executor: command
+    timeout_seconds: 300
+    max_output_bytes: 1048576
+    argv:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p .giga/artifacts
+        go test ./... -coverprofile=.giga/artifacts/cover.out -covermode=count >/dev/null 2>&1 || true
+        python3 - <<'PY'
+        import json, re, os
+        module = ""
+        try:
+            for line in open("go.mod"):
+                if line.startswith("module "):
+                    module = line.split()[1].strip()
+                    break
+        except FileNotFoundError:
+            pass
+        files = {}
+        try:
+            raw = open(".giga/artifacts/cover.out").read().splitlines()
+        except FileNotFoundError:
+            raw = []
+        pattern = re.compile(r"^(.+):(\d+)\.\d+,(\d+)\.\d+ \d+ (\d+)$")
+        for line in raw[1:]:
+            m = pattern.match(line)
+            if not m:
+                continue
+            path, start, end, count = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
+            if module and path.startswith(module + "/"):
+                path = path[len(module) + 1:]
+            hits = files.setdefault(path, {})
+            for ln in range(start, end + 1):
+                hits[ln] = max(hits.get(ln, 0), count)
+        out = {
+            "files": [
+                {
+                    "path": p,
+                    "line_hits": [{"line": ln, "hits": h} for ln, h in sorted(v.items())],
+                }
+                for p, v in files.items()
+            ]
+        }
+        json.dump(out, open(".giga/artifacts/coverage.json", "w"))
+        print("coverage files:", len(out["files"]))
+        PY
+    produces:
+      - kind: coverage
+        format: generic
+        path: .giga/artifacts/coverage.json
+        complete: false
+        evidence_scope: {selection: full, test_set: unit}
