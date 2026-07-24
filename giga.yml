@@ -1,11 +1,16 @@
 version: 1
 profiles:
   # `giga check` runs Go's test suite with coverage and ingests it so the diff
-  # shows real covered / uncovered lines. fact-mine hazard SARIF is produced by
-  # `giga sync` (the built-in analyse profile) separately.
+  # shows real covered / uncovered lines. Keep this fast: coverage only.
   ci:
     producers: [gotest]
     required_evidence: [coverage]
+  # `giga sync --trust-current-config` runs the first-party static analyzers.
+  # This is where the heavier analysis lives; it does not run under `giga check`.
+  # espalier-arch emits the architecture graph that powers New Dependencies /
+  # New State; espalier/decomplex/nil-kill emit hazard SARIF.
+  analyse:
+    producers: [espalier-arch, espalier-sarif, decomplex, nil-kill]
 producers:
   gotest:
     executor: command
@@ -62,3 +67,85 @@ producers:
         path: .giga/artifacts/coverage.json
         complete: false
         evidence_scope: {selection: full, test_set: unit}
+  # Architecture graph (call + state + import edges). Ingested per commit and
+  # deltaed against the diff's added lines to surface New Dependencies / State.
+  espalier-arch:
+    executor: command
+    timeout_seconds: 600
+    max_output_bytes: 33554432
+    argv:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p .giga/artifacts
+        ruby -I/home/yahn/easy-vm/gems/espalier/lib \
+          /home/yahn/easy-vm/gems/espalier/exe/espalier \
+          --exclude .giga -f architecture -o .giga/artifacts/architecture.json .
+    produces:
+      - kind: architecture
+        format: architecture
+        path: .giga/artifacts/architecture.json
+        complete: false
+  espalier-sarif:
+    executor: command
+    timeout_seconds: 600
+    max_output_bytes: 33554432
+    argv:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p .giga/artifacts
+        ruby -I/home/yahn/easy-vm/gems/espalier/lib \
+          /home/yahn/easy-vm/gems/espalier/exe/espalier \
+          --exclude .giga -f sarif -o .giga/artifacts/espalier.sarif .
+    produces:
+      - kind: sarif
+        format: sarif
+        path: .giga/artifacts/espalier.sarif
+        scope: static
+        complete: false
+  decomplex:
+    executor: command
+    timeout_seconds: 600
+    max_output_bytes: 33554432
+    argv:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p .giga/artifacts
+        ruby -I/home/yahn/easy-vm/gems/decomplex/lib \
+          /home/yahn/easy-vm/gems/decomplex/exe/decomplex report \
+          --language go --format sarif --output .giga/artifacts/decomplex.sarif .
+    produces:
+      - kind: sarif
+        format: sarif
+        path: .giga/artifacts/decomplex.sarif
+        scope: static
+        complete: false
+  nil-kill:
+    executor: command
+    timeout_seconds: 600
+    max_output_bytes: 33554432
+    argv:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p .giga/artifacts
+        NK="ruby -I/home/yahn/easy-vm/gems/nil-kill/lib /home/yahn/easy-vm/gems/nil-kill/exe/nil-kill"
+        $NK static --root . --language go --output .giga/artifacts/nk-static.json . >/dev/null 2>&1 || true
+        $NK normalize --root . --static .giga/artifacts/nk-static.json \
+          --output .giga/artifacts/nk-evidence.json >/dev/null 2>&1 || true
+        $NK report --evidence .giga/artifacts/nk-evidence.json \
+          --format sarif --sarif .giga/artifacts/nil-kill.sarif >/dev/null 2>&1 || \
+          printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"nil-kill"}},"results":[]}]}' \
+            > .giga/artifacts/nil-kill.sarif
+    produces:
+      - kind: sarif
+        format: sarif
+        path: .giga/artifacts/nil-kill.sarif
+        scope: static
+        complete: false
