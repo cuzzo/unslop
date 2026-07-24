@@ -22,9 +22,12 @@ producers:
       - |
         set -e
         mkdir -p .giga/artifacts
-        go test ./... -coverprofile=.giga/artifacts/cover.out -covermode=count >/dev/null 2>&1 || true
-        python3 - <<'PY'
-        import json, re, os
+        COVER="$(mktemp)"
+        trap 'rm -f "$COVER"' EXIT
+        go test ./... -coverprofile="$COVER" -covermode=count >/dev/null 2>&1 || true
+        python3 - "$COVER" <<'PY'
+        import json, re, os, sys
+        cover_path = sys.argv[1]
         module = ""
         try:
             for line in open("go.mod"):
@@ -35,7 +38,7 @@ producers:
             pass
         files = {}
         try:
-            raw = open(".giga/artifacts/cover.out").read().splitlines()
+            raw = open(cover_path).read().splitlines()
         except FileNotFoundError:
             raw = []
         pattern = re.compile(r"^(.+):(\d+)\.\d+,(\d+)\.\d+ \d+ (\d+)$")
@@ -135,11 +138,16 @@ producers:
       - |
         set -e
         mkdir -p .giga/artifacts
+        # nil-kill's static/evidence intermediates are large (tens of MB) and
+        # only feed `report`; keep them in a scratch dir that is removed, so the
+        # only thing left in .giga is the small SARIF (staged + gzipped).
+        TMP="$(mktemp -d)"
+        trap 'rm -rf "$TMP"' EXIT
         NK="ruby -I/home/yahn/easy-vm/gems/nil-kill/lib /home/yahn/easy-vm/gems/nil-kill/exe/nil-kill"
-        $NK static --root . --language go --output .giga/artifacts/nk-static.json . >/dev/null 2>&1 || true
-        $NK normalize --root . --static .giga/artifacts/nk-static.json \
-          --output .giga/artifacts/nk-evidence.json >/dev/null 2>&1 || true
-        $NK report --evidence .giga/artifacts/nk-evidence.json \
+        $NK static --root . --language go --output "$TMP/nk-static.json" . >/dev/null 2>&1 || true
+        $NK normalize --root . --static "$TMP/nk-static.json" \
+          --output "$TMP/nk-evidence.json" >/dev/null 2>&1 || true
+        $NK report --evidence "$TMP/nk-evidence.json" \
           --format sarif --sarif .giga/artifacts/nil-kill.sarif >/dev/null 2>&1 || \
           printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"nil-kill"}},"results":[]}]}' \
             > .giga/artifacts/nil-kill.sarif
