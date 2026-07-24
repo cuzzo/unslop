@@ -21,9 +21,9 @@ producers:
       - -c
       - |
         set -e
-        mkdir -p .giga/artifacts
-        COVER="$(mktemp)"
-        trap 'rm -f "$COVER"' EXIT
+        mkdir -p .giga/artifacts .giga/scratch-cov
+        COVER=.giga/scratch-cov/cover.out
+        trap 'rm -rf .giga/scratch-cov' EXIT
         go test ./... -coverprofile="$COVER" -covermode=count >/dev/null 2>&1 || true
         python3 - "$COVER" <<'PY'
         import json, re, os, sys
@@ -136,21 +136,25 @@ producers:
       - sh
       - -c
       - |
-        set -e
         mkdir -p .giga/artifacts
         # nil-kill's static/evidence intermediates are large (tens of MB) and
-        # only feed `report`; keep them in a scratch dir that is removed, so the
+        # only feed `report`; keep them in a scratch dir under .giga (guaranteed
+        # writable in the sandbox, unlike /tmp) that is removed afterward, so the
         # only thing left in .giga is the small SARIF (staged + gzipped).
-        TMP="$(mktemp -d)"
+        TMP=.giga/scratch-nk
+        rm -rf "$TMP"; mkdir -p "$TMP"
         trap 'rm -rf "$TMP"' EXIT
         NK="ruby -I/home/yahn/easy-vm/gems/nil-kill/lib /home/yahn/easy-vm/gems/nil-kill/exe/nil-kill"
         $NK static --root . --language go --output "$TMP/nk-static.json" . >/dev/null 2>&1 || true
         $NK normalize --root . --static "$TMP/nk-static.json" \
           --output "$TMP/nk-evidence.json" >/dev/null 2>&1 || true
         $NK report --evidence "$TMP/nk-evidence.json" \
-          --format sarif --sarif .giga/artifacts/nil-kill.sarif >/dev/null 2>&1 || \
-          printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"nil-kill"}},"results":[]}]}' \
+          --format sarif --sarif .giga/artifacts/nil-kill.sarif >/dev/null 2>&1 || true
+        # Always leave a valid SARIF so the declared artifact exists.
+        if [ ! -s .giga/artifacts/nil-kill.sarif ]; then
+          printf '%s' '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"nil-kill"}},"results":[]}]}' \
             > .giga/artifacts/nil-kill.sarif
+        fi
     produces:
       - kind: sarif
         format: sarif
