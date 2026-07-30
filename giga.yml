@@ -10,7 +10,7 @@ profiles:
   # espalier-arch emits the architecture graph that powers New Dependencies /
   # New State; espalier/decomplex/nil-kill emit hazard SARIF.
   analyse:
-    producers: [espalier-arch, espalier-sarif, decomplex, nil-kill]
+    producers: [scip, espalier-arch, espalier-sarif, decomplex, nil-kill]
 producers:
   gotest:
     executor: command
@@ -72,6 +72,14 @@ producers:
         evidence_scope: {selection: full, test_set: unit}
   # Architecture graph (call + state + import edges). Ingested per commit and
   # deltaed against the diff's added lines to surface New Dependencies / State.
+  scip:
+    executor: gigasail
+    timeout_seconds: 600
+    argv: [scip-index]
+    produces:
+      - kind: auxiliary
+        format: scip
+        path: .giga/artifacts/index.scip
   espalier-arch:
     executor: command
     timeout_seconds: 600
@@ -82,16 +90,9 @@ producers:
       - |
         set -e
         mkdir -p .giga/artifacts
-        # Go receiver/callee types come from the compiler index, not source
-        # heuristics. Without it Big-O completeness collapses (93% -> 37% on
-        # this repo), so index first and feed it to espalier.
-        TMP=.giga/scratch-scip-arch
-        rm -rf "$TMP"; mkdir -p "$TMP"
-        trap 'rm -rf "$TMP"' EXIT
-        /home/yahn/go/bin/scip-go index ./... --quiet --output "$TMP/index.scip"
         ruby -I/home/yahn/litedb/gems/espalier/lib \
           /home/yahn/litedb/gems/espalier/exe/espalier \
-          --scip-index "$TMP/index.scip" \
+          --scip-index .giga/artifacts/index.scip \
           --exclude .giga -f architecture -o .giga/artifacts/architecture.json .
     produces:
       - kind: architecture
@@ -108,13 +109,9 @@ producers:
       - |
         set -e
         mkdir -p .giga/artifacts
-        TMP=.giga/scratch-scip-sarif
-        rm -rf "$TMP"; mkdir -p "$TMP"
-        trap 'rm -rf "$TMP"' EXIT
-        /home/yahn/go/bin/scip-go index ./... --quiet --output "$TMP/index.scip"
         ruby -I/home/yahn/litedb/gems/espalier/lib \
           /home/yahn/litedb/gems/espalier/exe/espalier \
-          --scip-index "$TMP/index.scip" \
+          --scip-index .giga/artifacts/index.scip \
           --exclude .giga -f sarif -o .giga/artifacts/espalier.sarif .
     produces:
       - kind: sarif
