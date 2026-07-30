@@ -82,8 +82,8 @@ producers:
       - |
         set -e
         mkdir -p .giga/artifacts
-        ruby -I/home/yahn/easy-vm/gems/espalier/lib \
-          /home/yahn/easy-vm/gems/espalier/exe/espalier \
+        ruby -I/home/yahn/litedb/gems/espalier/lib \
+          /home/yahn/litedb/gems/espalier/exe/espalier \
           --exclude .giga -f architecture -o .giga/artifacts/architecture.json .
     produces:
       - kind: architecture
@@ -100,8 +100,8 @@ producers:
       - |
         set -e
         mkdir -p .giga/artifacts
-        ruby -I/home/yahn/easy-vm/gems/espalier/lib \
-          /home/yahn/easy-vm/gems/espalier/exe/espalier \
+        ruby -I/home/yahn/litedb/gems/espalier/lib \
+          /home/yahn/litedb/gems/espalier/exe/espalier \
           --exclude .giga -f sarif -o .giga/artifacts/espalier.sarif .
     produces:
       - kind: sarif
@@ -119,8 +119,8 @@ producers:
       - |
         set -e
         mkdir -p .giga/artifacts
-        ruby -I/home/yahn/easy-vm/gems/decomplex/lib \
-          /home/yahn/easy-vm/gems/decomplex/exe/decomplex report \
+        ruby -I/home/yahn/litedb/gems/decomplex/lib \
+          /home/yahn/litedb/gems/decomplex/exe/decomplex report \
           --language go --format sarif --output .giga/artifacts/decomplex.sarif .
     produces:
       - kind: sarif
@@ -144,7 +144,7 @@ producers:
         TMP=.giga/scratch-nk
         rm -rf "$TMP"; mkdir -p "$TMP"
         trap 'rm -rf "$TMP"' EXIT
-        NK="ruby -I/home/yahn/easy-vm/gems/nil-kill/lib /home/yahn/easy-vm/gems/nil-kill/exe/nil-kill"
+        NK="ruby -I/home/yahn/litedb/gems/nil-kill/lib /home/yahn/litedb/gems/nil-kill/exe/nil-kill"
         $NK static --root . --language go --output "$TMP/nk-static.json" . >/dev/null 2>&1 || true
         $NK normalize --root . --static "$TMP/nk-static.json" \
           --output "$TMP/nk-evidence.json" >/dev/null 2>&1 || true
