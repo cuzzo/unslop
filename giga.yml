@@ -82,8 +82,16 @@ producers:
       - |
         set -e
         mkdir -p .giga/artifacts
+        # Go receiver/callee types come from the compiler index, not source
+        # heuristics. Without it Big-O completeness collapses (93% -> 37% on
+        # this repo), so index first and feed it to espalier.
+        TMP=.giga/scratch-scip-arch
+        rm -rf "$TMP"; mkdir -p "$TMP"
+        trap 'rm -rf "$TMP"' EXIT
+        /home/yahn/go/bin/scip-go index ./... --quiet --output "$TMP/index.scip"
         ruby -I/home/yahn/litedb/gems/espalier/lib \
           /home/yahn/litedb/gems/espalier/exe/espalier \
+          --scip-index "$TMP/index.scip" \
           --exclude .giga -f architecture -o .giga/artifacts/architecture.json .
     produces:
       - kind: architecture
@@ -100,8 +108,13 @@ producers:
       - |
         set -e
         mkdir -p .giga/artifacts
+        TMP=.giga/scratch-scip-sarif
+        rm -rf "$TMP"; mkdir -p "$TMP"
+        trap 'rm -rf "$TMP"' EXIT
+        /home/yahn/go/bin/scip-go index ./... --quiet --output "$TMP/index.scip"
         ruby -I/home/yahn/litedb/gems/espalier/lib \
           /home/yahn/litedb/gems/espalier/exe/espalier \
+          --scip-index "$TMP/index.scip" \
           --exclude .giga -f sarif -o .giga/artifacts/espalier.sarif .
     produces:
       - kind: sarif
