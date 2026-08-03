@@ -1,211 +1,80 @@
+# Gigasail's Go preset supplies fail-closed `go test ./...` coverage and the
+# embedded FactMine analyzer. Local policy below adds mutation auditing without
+# depending on a source checkout or swallowing producer failures.
 version: 1
-profiles:
-  # `giga check` runs Go's test suite with coverage and ingests it so the diff
-  # shows real covered / uncovered lines. Keep this fast: coverage only.
-  ci:
-    producers: [gotest]
-    required_evidence: [coverage]
-  # `giga sync --trust-current-config` runs the first-party static analyzers.
-  # This is where the heavier analysis lives; it does not run under `giga check`.
-  # espalier-arch emits the architecture graph that powers New Dependencies /
-  # New State; espalier/decomplex/nil-kill emit hazard SARIF.
-  analyse:
-    producers: [scip, espalier-arch, espalier-sarif, decomplex, nil-kill]
-producers:
-  gotest:
-    executor: command
-    timeout_seconds: 300
-    max_output_bytes: 1048576
-    argv:
-      - sh
-      - -c
-      - |
-        set -e
-        mkdir -p .giga/artifacts .giga/scratch-cov
-        COVER=.giga/scratch-cov/cover.out
-        trap 'rm -rf .giga/scratch-cov' EXIT
-        go test ./... -coverprofile="$COVER" -covermode=count >/dev/null 2>&1 || true
-        python3 - "$COVER" <<'PY'
-        import json, re, os, sys
-        cover_path = sys.argv[1]
-        module = ""
-        try:
-            for line in open("go.mod"):
-                if line.startswith("module "):
-                    module = line.split()[1].strip()
-                    break
-        except FileNotFoundError:
-            pass
-        files = {}
-        try:
-            raw = open(cover_path).read().splitlines()
-        except FileNotFoundError:
-            raw = []
-        pattern = re.compile(r"^(.+):(\d+)\.\d+,(\d+)\.\d+ \d+ (\d+)$")
-        for line in raw[1:]:
-            m = pattern.match(line)
-            if not m:
-                continue
-            path, start, end, count = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
-            if module and path.startswith(module + "/"):
-                path = path[len(module) + 1:]
-            hits = files.setdefault(path, {})
-            for ln in range(start, end + 1):
-                hits[ln] = max(hits.get(ln, 0), count)
-        out = {
-            "files": [
-                {
-                    "path": p,
-                    "line_hits": [{"line": ln, "hits": h} for ln, h in sorted(v.items())],
-                }
-                for p, v in files.items()
-            ]
-        }
-        json.dump(out, open(".giga/artifacts/coverage.json", "w"))
-        print("coverage files:", len(out["files"]))
-        PY
-    produces:
-      - kind: coverage
-        format: generic
-        path: .giga/artifacts/coverage.json
-        complete: false
-        evidence_scope: {selection: full, test_set: unit}
-  # Architecture graph (call + state + import edges). Ingested per commit and
-  # deltaed against the diff's added lines to surface New Dependencies / State.
-  scip:
-    executor: gigasail
-    timeout_seconds: 600
-    argv: [scip-index]
-    produces:
-      - kind: auxiliary
-        format: scip
-        path: .giga/artifacts/index.scip
-  espalier-arch:
-    executor: command
-    timeout_seconds: 600
-    max_output_bytes: 33554432
-    argv:
-      - sh
-      - -c
-      - |
-        set -e
-        mkdir -p .giga/artifacts
-        ruby -I/home/yahn/litedb/gems/espalier/lib \
-          /home/yahn/litedb/gems/espalier/exe/espalier \
-          --scip-index .giga/artifacts/index.scip \
-          --exclude .giga -f architecture -o .giga/artifacts/architecture.json .
-    produces:
-      - kind: architecture
-        format: architecture
-        path: .giga/artifacts/architecture.json
-        complete: false
-  espalier-sarif:
-    executor: command
-    timeout_seconds: 600
-    max_output_bytes: 33554432
-    argv:
-      - sh
-      - -c
-      - |
-        set -e
-        mkdir -p .giga/artifacts
-        ruby -I/home/yahn/litedb/gems/espalier/lib \
-          /home/yahn/litedb/gems/espalier/exe/espalier \
-          --scip-index .giga/artifacts/index.scip \
-          --exclude .giga -f sarif -o .giga/artifacts/espalier.sarif .
-    produces:
-      - kind: sarif
-        format: sarif
-        path: .giga/artifacts/espalier.sarif
-        scope: static
-        complete: false
-  decomplex:
-    executor: command
-    timeout_seconds: 600
-    max_output_bytes: 33554432
-    argv:
-      - sh
-      - -c
-      - |
-        set -e
-        mkdir -p .giga/artifacts
-        ruby -I/home/yahn/litedb/gems/decomplex/lib \
-          /home/yahn/litedb/gems/decomplex/exe/decomplex report \
-          --language go --format sarif --output .giga/artifacts/decomplex.sarif .
-    produces:
-      - kind: sarif
-        format: sarif
-        path: .giga/artifacts/decomplex.sarif
-        scope: static
-        complete: false
-  nil-kill:
-    executor: command
-    timeout_seconds: 600
-    max_output_bytes: 33554432
-    argv:
-      - sh
-      - -c
-      - |
-        mkdir -p .giga/artifacts
-        # nil-kill's static/evidence intermediates are large (tens of MB) and
-        # only feed `report`; keep them in a scratch dir under .giga (guaranteed
-        # writable in the sandbox, unlike /tmp) that is removed afterward, so the
-        # only thing left in .giga is the small SARIF (staged + gzipped).
-        TMP=.giga/scratch-nk
-        rm -rf "$TMP"; mkdir -p "$TMP"
-        trap 'rm -rf "$TMP"' EXIT
-        NK="ruby -I/home/yahn/litedb/gems/nil-kill/lib /home/yahn/litedb/gems/nil-kill/exe/nil-kill"
-        $NK static --root . --language go --output "$TMP/nk-static.json" . >/dev/null 2>&1 || true
-        $NK normalize --root . --static "$TMP/nk-static.json" \
-          --output "$TMP/nk-evidence.json" >/dev/null 2>&1 || true
-        $NK report --evidence "$TMP/nk-evidence.json" \
-          --format sarif --sarif .giga/artifacts/nil-kill.sarif >/dev/null 2>&1 || true
-        # Always leave a valid SARIF so the declared artifact exists.
-        if [ ! -s .giga/artifacts/nil-kill.sarif ]; then
-          printf '%s' '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"nil-kill"}},"results":[]}]}' \
-            > .giga/artifacts/nil-kill.sarif
-        fi
-    produces:
-      - kind: sarif
-        format: sarif
-        path: .giga/artifacts/nil-kill.sarif
-        scope: static
-        complete: false
+preset: go
 
-# ── Review: drives the evidence-aware diff verdict + the precommit/premerge
-# MCP review tools. Defaults are sane; this makes the intent explicit and turns
-# on the newer features (project graph, per-stage test depth, check gates).
+profiles:
+  ci:
+    producers: [go-test-coverage, slopcop]
+    required_evidence: [coverage, sarif]
+  mutation:
+    producers: [gremlins-audit]
+    required_evidence: [mutants]
+
+producers:
+  slopcop:
+    executor: command
+    argv:
+      - slopcop
+      - report
+      - --repo=.
+      - --coverage=.giga/artifacts/go-coverage.json
+      - --sarif=.giga/artifacts/slopcop.sarif
+    needs: [go-test-coverage]
+    timeout_seconds: 600
+    max_output_bytes: 33554432
+    produces:
+      - kind: sarif
+        format: sarif
+        path: .giga/artifacts/slopcop.sarif
+        scope: static
+        complete: false
+  gremlins-audit:
+    executor: command
+    argv:
+      - gremlins
+      - --silent
+      - unleash
+      - .
+      - --test-miser-output
+      - .giga/artifacts/gremlins-mutant-facts.json
+    timeout_seconds: 3600
+    max_output_bytes: 33554432
+    produces:
+      - kind: mutants
+        format: mutant-facts
+        path: .giga/artifacts/gremlins-mutant-facts.json
+        scope: unit
+        # Test Miser attribution surfaces directly in Giga's Tests view. It is
+        # deliberately not sent through SlopCop, whose input is source coverage.
+        # Partial attribution remains diagnostic and never becomes verified.
+        complete: false
+        evidence_scope:
+          selection: full
+          mutant_corpus: gremlins-v1
+          test_set: unit
+
 review:
-  # T3 findings stay visible but carry no ranking/gating weight.
   metrics:
-    "T3": { policy: deprioritize, weight: 0.0 }
-  # Escalate a change to CRITICAL on uncovered new tier-1 lines or an
-  # unverified hazard on added lines (the two default gates, made explicit).
+    "T3": {policy: deprioritize, weight: 0.0}
   gates:
     - id: uncovered-tier1
-      when: { tier: 1, on: added, coverage: uncovered }
+      when: {tier: 1, on: added, coverage: uncovered}
       severity: critical
     - id: unverified-hazard
-      when: { hazard: any, verified: false }
+      when: {hazard: any, verified: false}
       severity: critical
   report:
     group_by: tier
     max_findings_per_tier: 25
-  # Per-stage test depth. precommit = fast coverage (`ci`); premerge also runs
-  # the static analyzers (`analyse`). No Go mutation runner, so mutation stays off.
   tests:
-    precommit: { profiles: [ci], mutation: false }
-    premerge:  { profiles: [ci, analyse], mutation: false }
-  # Project graph: cmd depends on internal, so an internal/ change runs both.
-  # `go test ./...` covers the whole module, so producers dedupe to gotest.
-  checks_enabled: false          # opt-in; `giga test --checks` runs gofmt gates
+    precommit: {profiles: [ci], mutation: false}
+    premerge: {profiles: [ci, analyse, mutation], mutation: true}
+  checks_enabled: false
   packages:
-    core:
-      paths: [internal/**]
-      producers: [gotest]
-      checks: [contrib:fmt:go]
-    cli:
-      paths: [cmd/**, unslop.go, main.go]
-      depends_on: [core]
-      producers: [gotest]
+    root:
+      paths: ["**"]
+      producers: [go-test-coverage, slopcop]
+      premerge: [gremlins-audit]
       checks: [contrib:fmt:go]
