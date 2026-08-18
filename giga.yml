@@ -8,9 +8,15 @@ profiles:
   ci:
     producers: [go-test-coverage, slopcop]
     required_evidence: [coverage, sarif]
+  # Run on demand with `giga ci --profile mutation`, not as part of review.
+  # Gremlins keeps `complete` and `attribution_complete` false until per-test
+  # source coverage is exhaustive, and a synchronized profile may not publish
+  # partial evidence: it would cache a successful run while the review stayed
+  # permanently partial with no work left to schedule. So this profile neither
+  # requires the family nor joins the premerge set, and `mutation: false`
+  # below keeps it out. Its output is still diagnostic in the Tests view.
   mutation:
     producers: [gremlins-audit]
-    required_evidence: [mutants]
 
 producers:
   slopcop:
@@ -29,7 +35,10 @@ producers:
         format: sarif
         path: .giga/artifacts/slopcop.sarif
         scope: static
-        complete: false
+        complete: true
+        evidence_scope:
+          selection: go-production
+          test_set: static
   gremlins-audit:
     executor: command
     argv:
@@ -70,7 +79,7 @@ review:
     max_findings_per_tier: 25
   tests:
     precommit: {profiles: [ci], mutation: false}
-    premerge: {profiles: [ci, analyse, mutation], mutation: true}
+    premerge: {profiles: [ci, analyse], mutation: false}
   checks_enabled: false
   packages:
     root:
