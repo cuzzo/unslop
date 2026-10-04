@@ -1,15 +1,243 @@
 package scanner
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yahn/unslop/internal/config"
 )
+
+type cancellingDiagnostic struct{ cancel context.CancelFunc }
+
+func (w cancellingDiagnostic) Write(p []byte) (int, error) {
+	w.cancel()
+	return len(p), nil
+}
+
+func TestScanCancellationAndFutureFileAge(t *testing.T) {
+	t.Setenv("PATH", "")
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, _, _, err := InspectSubtree(ctx, root, time.Now()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("subtree continued after cancellation: %v", err)
+	}
+	engine := config.NewRuleEngine(config.Manifest{Rules: []config.Rule{{ID: "file", Target: "file", Patterns: []string{"*.bin"}, RiskClass: config.RiskRegenerable}}})
+	if items, err := ScanLive(ctx, []string{root}, engine, 0, 0, 0, false, io.Discard, nil); !errors.Is(err, context.Canceled) || len(items) != 0 {
+		t.Fatalf("scan continued after cancellation: %+v %v", items, err)
+	}
+	path := filepath.Join(root, "future.bin")
+	if err := os.WriteFile(path, []byte("future"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(24 * time.Hour)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatal(err)
+	}
+	items, err := ScanLive(context.Background(), []string{path}, engine, 0, 0, 0, false, io.Discard, nil)
+	if err != nil || len(items) != 1 || items[0].AgeDays != 0 {
+		t.Fatalf("future file has invalid age: %+v %v", items, err)
+	}
+}
+
+func TestScanStopsAfterDiagnosticCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+		t.Skip("POSIX permissions")
+	}
+	root := t.TempDir()
+	blocked := filepath.Join(root, "container", "a-blocked")
+	if err := os.MkdirAll(blocked, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(blocked, 0000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(blocked, 0700)
+	if err := os.WriteFile(filepath.Join(root, "container", "z-payload"), []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	items, err := ScanLive(ctx, []string{root}, config.NewRuleEngine(config.Manifest{}), 0, 0, 0, false, cancellingDiagnostic{cancel}, nil)
+	if ctx.Err() == nil || err == nil || len(items) != 0 {
+		t.Fatalf("diagnostic cancellation ignored: %+v %v", items, err)
+	}
+}
+
+func TestSubtreeRejectsUnreadableEntryMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+		t.Skip("POSIX permissions")
+	}
+	path := filepath.Join(t.TempDir(), "cache")
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "payload"), []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0400); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(path, 0700)
+	if _, _, _, protected, err := InspectSubtree(context.Background(), path, time.Now()); err == nil || !protected {
+		t.Fatalf("uninspectable subtree accepted: protected=%t err=%v", protected, err)
+	}
+	engine := config.NewRuleEngine(config.Manifest{Rules: []config.Rule{{ID: "cache", Target: "dir", Patterns: []string{"cache"}, RiskClass: config.RiskRegenerable}}})
+	items, err := ScanLive(context.Background(), []string{path}, engine, 0, 0, 0, false, io.Discard, nil)
+	if err == nil {
+		t.Fatal("scan concealed incomplete metadata")
+	}
+	for _, item := range items {
+		if item.CanDelete {
+			t.Fatalf("uninspectable cache is actionable: %+v", item)
+		}
+	}
+}
+
+func TestScanReportsUnreadableDirectories(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+		t.Skip("POSIX permissions")
+	}
+	root := t.TempDir()
+	restricted := filepath.Join(root, "restricted")
+	if err := os.Mkdir(restricted, 0000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(restricted, 0700)
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stderr
+	os.Stderr = write
+	defer func() { os.Stderr = original }()
+	ScanParallel([]string{root}, config.NewRuleEngine(config.Manifest{}), 0, 0, 0, false)
+	write.Close()
+	output, _ := io.ReadAll(read)
+	read.Close()
+	if !strings.Contains(string(output), restricted) || !strings.Contains(string(output), "SCAN ERROR") {
+		t.Fatalf("missing access warning: %s", output)
+	}
+}
+
+func TestCheckedScanReportsMissingRootAndUnreadableCache(t *testing.T) {
+	t.Setenv("PATH", "")
+	engine := config.NewRuleEngine(config.Manifest{Rules: []config.Rule{{ID: "cache", Target: "dir", Patterns: []string{"cache"}, RiskClass: config.RiskRegenerable}}})
+	if _, err := ScanParallelChecked([]string{filepath.Join(t.TempDir(), "missing")}, engine, 0, 0, 0, false); err == nil {
+		t.Fatal("missing root did not fail")
+	}
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+		return
+	}
+	cache := filepath.Join(t.TempDir(), "cache")
+	if err := os.Mkdir(cache, 0000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(cache, 0700)
+	candidates, err := ScanParallelChecked([]string{cache}, engine, 0, 0, 0, false)
+	if err == nil {
+		t.Fatal("unreadable cache did not fail")
+	}
+	for _, c := range candidates {
+		if c.CanDelete {
+			t.Fatal("unreadable candidate actionable")
+		}
+	}
+}
+
+func TestDefaultRootsIncludeUserTemp(t *testing.T) {
+	home, tmp := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("TMPDIR", tmp)
+	t.Setenv("TMP", tmp)
+	t.Setenv("TEMP", tmp)
+	for _, p := range GetDefaultScanDirs() {
+		if p == tmp {
+			return
+		}
+	}
+	t.Fatal("user temp missing from default scan roots")
+}
+
+func TestSessionsAreIndividuallyOptIn(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("PATH", "")
+	m, err := config.LoadManifest("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	paths := []string{".pi/agent/sessions/project/old.jsonl", ".gemini/antigravity-cli/brain/old/transcript.jsonl", ".gemini/antigravity/brain/old/task.md"}
+	for _, p := range paths {
+		p = filepath.Join(home, p)
+		if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("history"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		os.Chtimes(p, old, old)
+		os.Chtimes(filepath.Dir(p), old, old)
+	}
+	fresh := filepath.Join(home, ".pi/agent/sessions/project/new.jsonl")
+	if err := os.WriteFile(fresh, []byte("active"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, include := range []bool{false, true} {
+		candidates := ScanParallel([]string{home}, config.NewRuleEngine(m), 7, 0, 0, include)
+		want := 0
+		if include {
+			want = len(paths)
+		}
+		if len(candidates) != want {
+			t.Fatalf("include=%v got %+v want %d sessions", include, candidates, want)
+		}
+		for _, c := range candidates {
+			if c.RiskClass != config.RiskUserData || !c.CanDelete || c.Path == fresh {
+				t.Fatalf("unexpected candidate %+v", c)
+			}
+		}
+	}
+}
+
+func TestRecentAntigravitySessionIsNotPartiallyCleaned(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("PATH", "")
+	m, err := config.LoadManifest("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := filepath.Join(home, ".gemini/antigravity-cli/brain/recent")
+	if err := os.MkdirAll(session, 0700); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(session, "transcript.jsonl")
+	if err := os.WriteFile(transcript, []byte(strings.Repeat("X", 6*1024*1024)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	os.Chtimes(transcript, old, old)
+	if err := os.WriteFile(filepath.Join(session, "task.md"), []byte("recent activity"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if candidates := ScanParallel([]string{home}, config.NewRuleEngine(m), 7, 0, 0, true); len(candidates) != 0 {
+		t.Fatalf("recent session partially selected: %+v", candidates)
+	}
+}
 
 func TestScannerActual12kCandidateScan(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -186,40 +414,16 @@ func TestEcosystemManifestRules(t *testing.T) {
 
 	candidates := ScanParallel([]string{tmpDir}, engine, 2.0, 0, 0, true)
 
-	foundRules := make(map[string]bool)
+	foundPaths := make(map[string]bool)
 	for _, c := range candidates {
-		foundRules[c.RuleID] = true
+		foundPaths[c.Path] = true
 	}
 
-	expectedRuleIDs := []string{
-		"unity_build",
-		"unreal_build",
-		"godot_cache",
-		"turbo_cache",
-		"jupyter_checkpoints",
-		"elixir_build",
-		"terraform_cache",
-		"haskell_build",
-		"dart_build",
-		"pixi_env",
-	}
-
-	for _, ruleID := range expectedRuleIDs {
-		if !foundRules[ruleID] {
-			t.Errorf("Expected candidate for rule '%s', but none was found during scan of %s", ruleID, tmpDir)
+	for _, path := range []string{unityLib, unrealInter, godotCache, turboCache, jupyterCache, elixirBuild, tfCache, haskellWork, dartTool, pixiEnv} {
+		if !foundPaths[path] {
+			t.Errorf("Expected candidate %s, but none was found during scan of %s", path, tmpDir)
 		}
 	}
-
-	_ = unityLib
-	_ = unrealInter
-	_ = godotCache
-	_ = turboCache
-	_ = jupyterCache
-	_ = elixirBuild
-	_ = tfCache
-	_ = haskellWork
-	_ = dartTool
-	_ = pixiEnv
 }
 
 func TestGitIgnoredTaggingInScanner(t *testing.T) {
@@ -358,3 +562,46 @@ func TestIsExecutableBinaryAndDevBinaryHighlight(t *testing.T) {
 	}
 }
 
+func TestConcurrentScanDiagnostics(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+		t.Skip("POSIX permissions")
+	}
+	root := t.TempDir()
+	for index := 0; index < 64; index++ {
+		path := filepath.Join(root, fmt.Sprint(index), "restricted")
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(path, 0700) })
+	}
+	release := make(chan struct{})
+	diagnostic := gatedDiagnostics{release: release}
+	progressSeen := false
+	_, err := ScanLive(context.Background(), []string{root}, config.NewRuleEngine(config.Manifest{}), 0, 0, 0, false, &diagnostic, func(progress Progress) {
+		if !progress.Done && !progressSeen {
+			progressSeen = true
+			close(release)
+		}
+	})
+	if err == nil || !progressSeen || strings.Count(diagnostic.String(), "[SCAN ERROR]") != 64 {
+		t.Fatalf("concurrent diagnostics lost: %s; error: %v", &diagnostic, err)
+	}
+}
+
+type gatedDiagnostics struct {
+	bytes.Buffer
+	release <-chan struct{}
+}
+
+func (writer *gatedDiagnostics) Write(data []byte) (int, error) {
+	<-writer.release
+	return writer.Buffer.Write(data)
+}
+
+func ScanParallel(scanDirs []string, engine *config.RuleEngine, minDays float64, maxDays float64, minSizeBytes int64, includeData bool) []Candidate {
+	candidates, _ := ScanParallelChecked(scanDirs, engine, minDays, maxDays, minSizeBytes, includeData)
+	return candidates
+}

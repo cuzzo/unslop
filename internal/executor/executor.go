@@ -3,14 +3,15 @@ package executor
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 
 	"path/filepath"
+	"runtime"
 
 	"strings"
 	"sync"
@@ -41,21 +42,9 @@ type ExecutionResult struct {
 	Errors       []string
 }
 
-var (
-	journalMutex        sync.Mutex
-	journalPathOverride string
-)
-
-func SetJournalPathOverride(path string) {
-	journalMutex.Lock()
-	defer journalMutex.Unlock()
-	journalPathOverride = path
-}
+var journalMutex sync.Mutex
 
 func getJournalPath() string {
-	if journalPathOverride != "" {
-		return journalPathOverride
-	}
 	if env := os.Getenv("UNSLOP_JOURNAL_PATH"); env != "" {
 		return env
 	}
@@ -243,7 +232,7 @@ func rollbackQuarantine(entry QuarantineJournalEntry) error {
 		return fmt.Errorf("failed to create original parent directory during rollback: %w", err)
 	}
 
-	if err := movePath(entry.QuarantinePath, origPath); err != nil {
+	if err := os.Rename(entry.QuarantinePath, origPath); err != nil {
 		return fmt.Errorf("failed to restore %s to %s: %w", entry.QuarantinePath, origPath, err)
 	}
 
@@ -290,7 +279,7 @@ func RecoverOrphanedQuarantines(scanDirs []string, out io.Writer) int {
 				}
 				targetPath := filepath.Join(parent, origName)
 				if _, err := os.Lstat(targetPath); os.IsNotExist(err) {
-					if errMove := movePath(path, targetPath); errMove == nil {
+					if errMove := os.Rename(path, targetPath); errMove == nil {
 						count++
 						fmt.Fprintf(out, "[ORPHAN RECOVERY] Restored orphaned quarantine %s -> %s\n", path, targetPath)
 					}
@@ -301,10 +290,6 @@ func RecoverOrphanedQuarantines(scanDirs []string, out io.Writer) int {
 		})
 	}
 	return count
-}
-
-func movePath(src, dst string) error {
-	return os.Rename(src, dst)
 }
 
 func findUniqueTrashDest(filesDir, origName string) (string, string) {
@@ -338,6 +323,9 @@ func createTrashInfo(infoDir, trashName, origPath string) (string, error) {
 }
 
 func moveToTrash(path string) error {
+	if runtime.GOOS != "linux" {
+		return platform.MoveToTrashOS(path)
+	}
 	home, errHome := os.UserHomeDir()
 	if errHome == nil && home != "" {
 		trashDir := filepath.Join(home, ".local", "share", "Trash")
@@ -363,7 +351,7 @@ func moveToTrash(path string) error {
 	return platform.MoveToTrashOS(path)
 }
 
-func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash bool, allowData bool, stdin io.Reader, stdout, stderr io.Writer, diskTotal, diskUsed, diskFree uint64, manifest config.Manifest) ExecutionResult {
+func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash bool, allowData bool, stdin io.Reader, stdout, stderr io.Writer, diskUsed uint64, manifest config.Manifest) ExecutionResult {
 	res := ExecutionResult{}
 	if len(selected) == 0 {
 		fmt.Fprintln(stdout, "No items selected. Exiting.")
@@ -371,33 +359,29 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 	}
 
 	engine := config.NewRuleEngine(manifest)
-	pkgInventory := scanner.LoadPackageInventory()
 
 	var actionable []scanner.Candidate
 	var reportOnly []scanner.Candidate
 
 	for _, c := range selected {
-		rule, _, _ := engine.MatchDir(filepath.Base(c.Path), c.Path, pkgInventory.CargoPkgs)
+		rule := engine.Match(filepath.Base(c.Path), c.Path, true)
 		if rule == nil {
-			fi, errStat := os.Lstat(c.Path)
+			_, errStat := os.Lstat(c.Path)
 			if errStat == nil {
-				rule, _, _ = engine.MatchFile(filepath.Base(c.Path), c.Path, fi, pkgInventory.CargoPkgs)
+				rule = engine.Match(filepath.Base(c.Path), c.Path, false)
 			}
 		}
-		if rule == nil {
-			rule = &config.Rule{
-				ID:        c.RuleID,
-				Category:  c.Category,
-				RiskClass: c.RiskClass,
-			}
-		}
-
-		authAction, canDel := c.ProposedAction, c.CanDelete
+		riskClass := c.RiskClass
 		if rule != nil {
-			authAction, canDel = c.ProposedAction, c.CanDelete
+			riskClass = rule.RiskClass
 		}
 
-		if !canDel || authAction == "report-only" {
+		if riskClass == config.RiskUserData && !allowData {
+			reportOnly = append(reportOnly, c)
+			continue
+		}
+
+		if !c.CanDelete {
 			reportOnly = append(reportOnly, c)
 		} else {
 			actionable = append(actionable, c)
@@ -416,12 +400,12 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 
 	if len(actionable) > 0 {
 		fmt.Fprintf(stdout, "\n============================================================\n")
-		fmt.Fprintf(stdout, " STAGED FOR REVIEW: %d items (%s)\n", len(actionable), ui.FormatBytes(totalActionable))
+		fmt.Fprintf(stdout, " STAGED FOR REVIEW: %d items (%s)\n", len(actionable), format.FormatBytes(totalActionable))
 		if useTrash {
-			fmt.Fprintf(stdout, " DISK SAVINGS: Move to Trash (%s staged; use -force-permanent to reclaim space)\n", ui.FormatBytes(totalActionable))
+			fmt.Fprintf(stdout, " DISK SAVINGS: Move to Trash (%s staged; use -force-permanent to reclaim space)\n", format.FormatBytes(totalActionable))
 		} else {
 			fmt.Fprintf(stdout, " DISK SAVINGS: %s used -> %s used (Will free %s)\n",
-				ui.FormatUintBytes(diskUsed), ui.FormatUintBytes(newDiskUsed), ui.FormatBytes(totalActionable))
+				format.FormatUintBytes(diskUsed), format.FormatUintBytes(newDiskUsed), format.FormatBytes(totalActionable))
 		}
 		fmt.Fprintf(stdout, "============================================================\n")
 		for _, c := range actionable {
@@ -429,23 +413,12 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 			if c.IsDir {
 				kind = "DIR "
 			}
-			abbrevPath := format.AbbreviateHomePath(c.Path)
-			var tags []string
-			if c.IsGitIgnored {
-				tags = append(tags, "[GITIGNORE]")
-			}
-			if c.IsDevBinary {
-				tags = append(tags, "[DEV BINARY]")
-			}
-			pathTag := abbrevPath
-			if len(tags) > 0 {
-				pathTag = strings.Join(tags, " ") + " " + abbrevPath
-			}
+
 			statusTag := ""
 			if c.RiskClass == config.RiskUserData {
 				statusTag = " [REQUIRES -apply-data]"
 			}
-			fmt.Fprintf(stdout, " [%s: %-13s | RISK: %-16s] %10s | %s old | %s%s\n", kind, c.Category, c.RiskClass, ui.FormatBytes(c.Size), format.FormatAgeDays(c.AgeDays), pathTag, statusTag)
+			fmt.Fprintf(stdout, " [%s: %-13s | RISK: %-16s] %10s | %s old | %s%s\n", kind, c.Category, c.RiskClass, format.FormatBytes(c.Size), format.FormatAgeDays(c.AgeDays), ui.CandidatePath(c, false), statusTag)
 		}
 		fmt.Fprintf(stdout, "============================================================\n")
 	}
@@ -456,24 +429,15 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 			totalReportOnly += c.Size
 		}
 		fmt.Fprintf(stdout, "\n============================================================\n")
-		fmt.Fprintf(stdout, " REPORT-ONLY / INFORMATIONAL (No Deletion Staged): %d items (%s)\n", len(reportOnly), ui.FormatBytes(totalReportOnly))
+		fmt.Fprintf(stdout, " REPORT-ONLY / INFORMATIONAL (No Deletion Staged): %d items (%s)\n", len(reportOnly), format.FormatBytes(totalReportOnly))
 		fmt.Fprintf(stdout, "============================================================\n")
 		for _, c := range reportOnly {
 			kind := "FILE"
 			if c.IsDir {
 				kind = "DIR "
 			}
-			abbrevPath := format.AbbreviateHomePath(c.Path)
-			var tags []string
-			tags = append(tags, "[CANNOT DELETE]")
-			if c.IsGitIgnored {
-				tags = append(tags, "[GITIGNORE]")
-			}
-			if c.IsDevBinary {
-				tags = append(tags, "[DEV BINARY]")
-			}
-			pathStr := strings.Join(tags, " ") + " " + abbrevPath
-			fmt.Fprintf(stdout, " [%s: %-13s | RISK: %-16s] %10s | %s old | %s [REPORT-ONLY]\n", kind, c.Category, c.RiskClass, ui.FormatBytes(c.Size), format.FormatAgeDays(c.AgeDays), pathStr)
+
+			fmt.Fprintf(stdout, " [%s: %-13s | RISK: %-16s] %10s | %s old | %s [REPORT-ONLY]\n", kind, c.Category, c.RiskClass, format.FormatBytes(c.Size), format.FormatAgeDays(c.AgeDays), ui.CandidatePath(c, true))
 		}
 		fmt.Fprintf(stdout, "============================================================\n")
 	}
@@ -503,21 +467,9 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 	jPath := getJournalPath()
 
 	for _, c := range actionable {
-		rule, _, uninstallArgs := engine.MatchDir(filepath.Base(c.Path), c.Path, pkgInventory.CargoPkgs)
-		if rule == nil {
-			fi, errStat := os.Lstat(c.Path)
-			if errStat == nil {
-				rule, _, uninstallArgs = engine.MatchFile(filepath.Base(c.Path), c.Path, fi, pkgInventory.CargoPkgs)
-			}
-		}
 
 		hasProtected := platform.ContainsProtectedPath(c.Path)
-		authAction, canDel := c.ProposedAction, c.CanDelete
-		if rule != nil {
-			authAction, canDel = c.ProposedAction, c.CanDelete
-		}
-
-		if hasProtected || !canDel || authAction == "report-only" {
+		if hasProtected || !c.CanDelete {
 			fmt.Fprintf(stdout, " [PROTECTED SAFEGUARD] %s contains protected credential/config files inside. Refusing deletion!\n", c.Path)
 			res.Skipped++
 			continue
@@ -538,7 +490,7 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 		}
 
 		if c.IsDir {
-			sz, maxModTime, _, _, errInsp := inspectSubtreeForRevalidation(c.Path)
+			sz, maxModTime, _, _, errInsp := scanner.InspectSubtree(context.Background(), c.Path, time.Now())
 			if errInsp != nil {
 				fmt.Fprintf(stdout, " [REVALIDATION FAILURE] %s unreadable subtree during revalidation: %v. Skipping.\n", c.Path, errInsp)
 				res.Skipped++
@@ -546,7 +498,7 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 			}
 			if sz != c.Size {
 				fmt.Fprintf(stdout, " [REVALIDATION FAILURE] %s size changed from %s to %s during scan window. Aborting deletion!\n",
-					c.Path, ui.FormatBytes(c.Size), ui.FormatBytes(sz))
+					c.Path, format.FormatBytes(c.Size), format.FormatBytes(sz))
 				res.Skipped++
 				continue
 			}
@@ -563,7 +515,7 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 			}
 		} else {
 			if fiNow.Size() != c.Size {
-				fmt.Fprintf(stdout, " [REVALIDATION FAILURE] %s size changed from %s to %s. Aborting!\n", c.Path, ui.FormatBytes(c.Size), ui.FormatBytes(fiNow.Size()))
+				fmt.Fprintf(stdout, " [REVALIDATION FAILURE] %s size changed from %s to %s. Aborting!\n", c.Path, format.FormatBytes(c.Size), format.FormatBytes(fiNow.Size()))
 				res.Skipped++
 				continue
 			}
@@ -608,7 +560,7 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 			continue
 		}
 
-		if errMove := movePath(c.Path, quarantinePath); errMove != nil {
+		if errMove := os.Rename(c.Path, quarantinePath); errMove != nil {
 			fmt.Fprintf(stderr, " [QUARANTINE FAILURE] Failed to isolate %s into quarantine %s: %v. Aborting!\n", c.Path, quarantinePath, errMove)
 			_ = removeJournalEntry(jPath, opID)
 			res.Errors = append(res.Errors, fmt.Sprintf("Quarantine isolate failed for %s", c.Path))
@@ -616,108 +568,39 @@ func ConfirmAndDeleteWithIO(selected []scanner.Candidate, dryRun bool, useTrash 
 			continue
 		}
 
-		if authAction == "uninstall_package" && len(uninstallArgs) > 0 {
-			cmdName := uninstallArgs[0]
-			cmdArgs := uninstallArgs[1:]
-			fmt.Fprintf(stdout, " [UNINSTALL PACKAGE] Running %s...\n", strings.Join(uninstallArgs, " "))
-			cmd := exec.Command(cmdName, cmdArgs...)
-			var errBuf bytes.Buffer
-			cmd.Stderr = &errBuf
-			if errRun := cmd.Run(); errRun != nil {
-				fmt.Fprintf(stderr, " [UNINSTALL FAILURE] Package manager command failed: %v. Output: %s. Rolling back quarantine...\n", errRun, errBuf.String())
-				if errRB := rollbackQuarantine(entry); errRB != nil {
-					fmt.Fprintf(stderr, " [ROLLBACK CRITICAL] Rollback failed for %s: %v!\n", c.Path, errRB)
-				} else {
-					_ = removeJournalEntry(jPath, opID)
-				}
-				res.Errors = append(res.Errors, fmt.Sprintf("Package uninstall failed for %s", c.Path))
-				res.Skipped++
-				continue
+		var actionErr error
+		if useTrash {
+			actionErr = moveToTrash(quarantinePath)
+		} else {
+			actionErr = os.RemoveAll(quarantinePath)
+		}
+		if actionErr != nil {
+			failure := "RemoveAll failed"
+			if useTrash {
+				failure = "Trash move failed"
+				fmt.Fprintf(stderr, " [TRASH FAILURE] Trash failed for %s: %v. Rolling back quarantine...\n", c.Path, actionErr)
+			} else {
+				fmt.Fprintf(stderr, " [DELETE FAILURE] Deletion failed for %s: %v. Rolling back quarantine...\n", c.Path, actionErr)
 			}
-
-			_ = updateJournalEntryPhase(jPath, opID, "completed")
-			_ = os.RemoveAll(quarantinePath)
-			_ = removeJournalEntry(jPath, opID)
-			res.DeletedCount++
-			res.DeletedBytes += c.Size
-			fmt.Fprintf(stdout, " [SUCCESS] Uninstalled %s and removed %s (%s freed)\n", c.PackageName, c.Path, ui.FormatBytes(c.Size))
+			if errRB := rollbackQuarantine(entry); errRB != nil {
+				fmt.Fprintf(stderr, " [ROLLBACK CRITICAL] Rollback failed for %s: %v!\n", c.Path, errRB)
+			} else {
+				_ = removeJournalEntry(jPath, opID)
+			}
+			res.Errors = append(res.Errors, fmt.Sprintf("%s for %s", failure, c.Path))
+			res.Skipped++
 			continue
 		}
-
+		_ = updateJournalEntryPhase(jPath, opID, "completed")
+		_ = removeJournalEntry(jPath, opID)
+		res.DeletedCount++
+		res.DeletedBytes += c.Size
 		if useTrash {
-			if errTrash := moveToTrash(quarantinePath); errTrash != nil {
-				fmt.Fprintf(stderr, " [TRASH FAILURE] Trash failed for %s: %v. Rolling back quarantine...\n", c.Path, errTrash)
-				if errRB := rollbackQuarantine(entry); errRB != nil {
-					fmt.Fprintf(stderr, " [ROLLBACK CRITICAL] Rollback failed for %s: %v!\n", c.Path, errRB)
-				} else {
-					_ = removeJournalEntry(jPath, opID)
-				}
-				res.Errors = append(res.Errors, fmt.Sprintf("Trash move failed for %s", c.Path))
-				res.Skipped++
-				continue
-			}
-			_ = updateJournalEntryPhase(jPath, opID, "completed")
-			_ = removeJournalEntry(jPath, opID)
-			res.DeletedCount++
-			res.DeletedBytes += c.Size
-			fmt.Fprintf(stdout, " [SUCCESS] Moved to Trash: %s (%s)\n", c.Path, ui.FormatBytes(c.Size))
+			fmt.Fprintf(stdout, " [SUCCESS] Moved to Trash: %s (%s)\n", c.Path, format.FormatBytes(c.Size))
 		} else {
-			if errRemove := os.RemoveAll(quarantinePath); errRemove != nil {
-				fmt.Fprintf(stderr, " [DELETE FAILURE] Deletion failed for %s: %v. Rolling back quarantine...\n", c.Path, errRemove)
-				if errRB := rollbackQuarantine(entry); errRB != nil {
-					fmt.Fprintf(stderr, " [ROLLBACK CRITICAL] Rollback failed for %s: %v!\n", c.Path, errRB)
-				} else {
-					_ = removeJournalEntry(jPath, opID)
-				}
-				res.Errors = append(res.Errors, fmt.Sprintf("RemoveAll failed for %s", c.Path))
-				res.Skipped++
-				continue
-			}
-			_ = updateJournalEntryPhase(jPath, opID, "completed")
-			_ = removeJournalEntry(jPath, opID)
-			res.DeletedCount++
-			res.DeletedBytes += c.Size
-			fmt.Fprintf(stdout, " [SUCCESS] Permanently deleted %s (%s freed)\n", c.Path, ui.FormatBytes(c.Size))
+			fmt.Fprintf(stdout, " [SUCCESS] Permanently deleted %s (%s freed)\n", c.Path, format.FormatBytes(c.Size))
 		}
 	}
 
 	return res
-}
-
-func inspectSubtreeForRevalidation(dirPath string) (size int64, maxModTime time.Time, fileCount int64, hasProtected bool, err error) {
-	fi, errLstat := os.Lstat(dirPath)
-	if errLstat != nil {
-		return 0, time.Now(), 0, true, errLstat
-	}
-	maxModTime = fi.ModTime()
-
-	var walkErr error
-	errWalk := filepath.WalkDir(dirPath, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			walkErr = err
-			return filepath.SkipAll
-		}
-		if platform.IsProtected(path) {
-			hasProtected = true
-		}
-
-		fileCount++
-		info, errInfo := d.Info()
-		if errInfo != nil {
-			return nil
-		}
-
-		size += info.Size()
-		effTime := scanner.GetEffectiveItemTime(info)
-		if effTime.After(maxModTime) {
-			maxModTime = effTime
-		}
-		return nil
-	})
-
-	if errWalk != nil && walkErr == nil {
-		walkErr = errWalk
-	}
-
-	return size, maxModTime, fileCount, hasProtected, walkErr
 }

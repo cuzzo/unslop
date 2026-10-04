@@ -2,12 +2,6 @@ package repo
 
 import "io"
 
-type VCSKind string
-
-const (
-	VCSGit VCSKind = "git"
-)
-
 type HistoryCandidate struct {
 	ID          int    `json:"id"`
 	Path        string `json:"path"`
@@ -21,14 +15,6 @@ type HistoryCandidate struct {
 }
 
 type ScanOptions struct {
-	MinSizeMB      float64
-	NonInteractive bool
-	OutputFile     string
-	Stderr         io.Writer
-}
-
-type VCSAnalyzer interface {
-	Kind() VCSKind
-	Detect(repoPath string) bool
-	AnalyzeHistory(repoPath string, opts ScanOptions) ([]HistoryCandidate, error)
+	MinSizeMB float64
+	Stderr    io.Writer
 }

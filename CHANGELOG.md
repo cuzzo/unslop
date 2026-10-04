@@ -2,6 +2,28 @@
 
 All notable changes to `unslop` will be documented in this file.
 
+## Unreleased
+
+### Added
+- Automatically discover repositories, group their registered worktrees, and show outstanding feature commits in the Repos tab (`r`); return to Files with `f`.
+- Reuse Git ancestry and patch comparisons to distinguish integrated work, successor branches, and changes requiring review.
+- Report obsolete linked directories only after checking retained history, local changes, ignored files, and locks.
+
+### Fixed
+- Skip generated `.giga` repositories during discovery; open Repos immediately with live results and an adaptive progress footer.
+- Route macOS cleanup through native Trash and replace the Linux executable with a portable source launcher.
+- Match path rules against absolute scan paths; anchor default user stores to home.
+- Report filesystem access failures and stop cleanup after an incomplete scan.
+- Require `fzf` for cleanup and enforce `-apply-data` for history deletion.
+- Keep standalone binaries report-only; add Xcode and Homebrew cache discovery.
+- Stop treating arbitrary cache directories, including model stores, as disposable temporary data.
+- Add opt-in Antigravity artifact/conversation stores and individual pi sessions while preserving credentials and configuration.
+- Use Giga's Go preset instead of Linux checkout paths and fabricated analyzer reports.
+
+Cause: Linux assumptions and blanket credential guards bypassed native Trash and session discovery; deletion did not enforce the second data opt-in.
+Missed signal: Platform command mocks and name-only fixtures did not exercise absolute paths, complete cleanup, or session stores.
+Prevention: Regression tests cover native Trash routing, absolute path matching, permission failures, session discovery, and both data opt-ins.
+
 ## [0.2.0-alpha] - 2026-07-21
 
 ### Added

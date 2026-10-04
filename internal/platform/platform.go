@@ -5,11 +5,23 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 var protectedAgentFilenames = []string{
 	"credentials.json", ".credentials", "auth.json", "id_rsa", "id_ed25519", "id_dsa", "secring.gpg",
+}
+
+func IsAgentContainer(path string) bool {
+	clean := "/" + strings.TrimPrefix(filepath.ToSlash(filepath.Clean(strings.ToLower(path))), "/")
+	if strings.HasSuffix(clean, "/.gemini") || strings.HasSuffix(clean, "/.pi") || strings.HasSuffix(clean, "/.pi/agent") {
+		return true
+	}
+	for _, tool := range []string{"antigravity", "antigravity-cli", "antigravity-ide", "antigravity-backup"} {
+		if strings.HasSuffix(clean, "/.gemini/"+tool) {
+			return true
+		}
+	}
+	return false
 }
 
 func IsProtected(path string) bool {
@@ -19,8 +31,22 @@ func IsProtected(path string) bool {
 			return true
 		}
 	}
-	cleanPath := filepath.ToSlash(strings.ToLower(path))
-	if strings.Contains(cleanPath, "/.gemini/") || strings.Contains(cleanPath, "/.antigravity") {
+	cleanPath := "/" + strings.TrimPrefix(filepath.ToSlash(filepath.Clean(strings.ToLower(path))), "/")
+	if strings.Contains(cleanPath, "/.antigravity") || IsAgentContainer(path) {
+		return true
+	}
+	if _, tail, found := strings.Cut(cleanPath, "/.pi/"); found {
+		return tail != "agent/sessions" && !strings.HasPrefix(tail, "agent/sessions/")
+	}
+	if _, tail, found := strings.Cut(cleanPath, "/.gemini/"); found {
+		tool, subtree, _ := strings.Cut(tail, "/")
+		if tool == "antigravity" || tool == "antigravity-cli" || tool == "antigravity-ide" || tool == "antigravity-backup" {
+			root, _, _ := strings.Cut(subtree, "/")
+			switch root {
+			case "brain", "conversations", "cache", "implicit", "log", "crashes":
+				return false
+			}
+		}
 		return true
 	}
 	return false
@@ -43,22 +69,6 @@ func ContainsProtectedPath(targetPath string) bool {
 		return true
 	}
 	return foundProtected
-}
-
-func GetDiskSpace(path string) (totalBytes, usedBytes, freeBytes uint64, err error) {
-	return getDiskSpaceSyscall(path)
-}
-
-func MoveToTrashOS(path string) error {
-	return moveToTrashOS(path)
-}
-
-func GetStatTimes(info os.FileInfo) (atime, ctime time.Time, uid uint32, isPosix bool) {
-	return getStatTimes(info)
-}
-
-func GetFileIdentity(path string, info os.FileInfo) (dev uint64, ino uint64, supported bool) {
-	return getFileIdentity(path, info)
 }
 
 func ContainsMountOrReparsePoint(dirPath string) (bool, string, error) {

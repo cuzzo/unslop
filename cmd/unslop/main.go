@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -32,12 +33,59 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) > 0 && args[0] == "repo" {
-		return runRepoSubcommand(args[1:], stdin, stdout, stderr)
+	fileArgs := args
+	command, rest := splitCommand(args)
+	original := command
+	for {
+		var next []string
+		var code int
+		switch command {
+		case "repos", "worktrees":
+			code = runWorktreesSubcommand(rest, stdout, stderr, &next)
+		case "repo":
+			return runRepoSubcommand(rest, stdout, stderr)
+		case "files":
+			code = runFiles(rest, stdin, stdout, stderr, &next)
+		default:
+			code = runFiles(args, stdin, stdout, stderr, &next)
+		}
+		command, _ = splitCommand(next)
+		switch command {
+		case "files":
+			switch original {
+			case "repos", "worktrees":
+				args = next
+			default:
+				args = fileArgs
+			}
+		case "repos", "worktrees":
+			switch original {
+			case "repos", "worktrees":
+				args = fileArgs
+			default:
+				args = next
+			}
+		default:
+			return code
+		}
+		command, rest = splitCommand(args)
 	}
+}
 
+func splitCommand(args []string) (string, []string) {
+	if len(args) > 0 {
+		return args[0], args[1:]
+	}
+	return "", nil
+}
+
+func runFiles(args []string, stdin io.Reader, stdout, stderr io.Writer, next *[]string) int {
 	flags := flag.NewFlagSet("unslop", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: unslop [flags] | unslop repos [flags] | unslop worktrees [flags] | unslop repo [flags]")
+		flags.PrintDefaults()
+	}
 
 	daysFlag := flags.Float64("days", 7.0, "Minimum inactivity days to qualify as unslop candidate")
 	minDaysFlag := flags.Float64("min-days", 7.0, "Minimum inactivity days to qualify as unslop candidate")
@@ -56,27 +104,6 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	var paths multimodFlag
 	flags.Var(&paths, "path", "Explicit scan target root directories")
 
-	knownFlagsWithValue := map[string]bool{
-		"days":        true,
-		"min-days":    true,
-		"max-days":    true,
-		"min-size-mb": true,
-		"manifest":    true,
-		"path":        true,
-	}
-	knownBoolFlags := map[string]bool{
-		"dry-run":            true,
-		"apply":              true,
-		"apply-data":         true,
-		"include-data":       true,
-		"trash":              true,
-		"force-permanent":    true,
-		"recover-quarantine": true,
-		"version":            true,
-		"help":               true,
-		"h":                  true,
-	}
-
 	var flagArgs []string
 	var overrideArgs []string
 
@@ -89,18 +116,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 		if strings.HasPrefix(arg, "-") {
 			rawName := strings.TrimLeft(arg, "-")
-			name := rawName
-			if idx := strings.Index(rawName, "="); idx != -1 {
-				name = rawName[:idx]
-			}
-
-			if knownBoolFlags[name] {
+			name, _, hasValue := strings.Cut(rawName, "=")
+			if name == "help" || name == "h" {
 				flagArgs = append(flagArgs, arg)
 				continue
 			}
-			if knownFlagsWithValue[name] {
+			if f := flags.Lookup(name); f != nil {
 				flagArgs = append(flagArgs, arg)
-				if !strings.Contains(rawName, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && !strings.HasPrefix(args[i+1], "+") {
+				boolFlag, isBool := f.Value.(interface{ IsBoolFlag() bool })
+				if !(isBool && boolFlag.IsBoolFlag()) && !hasValue && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && !strings.HasPrefix(args[i+1], "+") {
 					i++
 					flagArgs = append(flagArgs, args[i])
 				}
@@ -205,48 +229,63 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	minSizeBytes := int64(minSizeMB * 1024 * 1024)
 
-	candidates := scanner.ScanParallel(scanDirs, engine, minDays, *maxDaysFlag, minSizeBytes, *includeDataFlag)
+	fzfBin := ui.FindFzf()
+	var candidates, selected []scanner.Candidate
+	var scanErr error
+	var worktreeTab bool
+	if fzfBin != "" {
+		selected, worktreeTab, scanErr = ui.ChooseFilesLive(fzfBin, diskTotal, diskUsed, diskFree, func(ctx context.Context, update func(scanner.Progress)) ([]scanner.Candidate, error) {
+			var err error
+			candidates, err = scanner.ScanLive(ctx, scanDirs, engine, minDays, *maxDaysFlag, minSizeBytes, *includeDataFlag, io.Discard, update)
+			return candidates, err
+		})
+	} else {
+		candidates, scanErr = scanner.ScanParallelChecked(scanDirs, engine, minDays, *maxDaysFlag, minSizeBytes, *includeDataFlag)
+	}
+	if scanErr != nil {
+		fmt.Fprintf(stderr, "Error: %v. On macOS, check Files & Folders permissions for your terminal.\n", scanErr)
+		if *applyFlag && !*dryRunFlag {
+			return 1
+		}
+	}
 
 	var totalCandidatesSizeBytes int64
 	for _, c := range candidates {
 		totalCandidatesSizeBytes += c.Size
 	}
 
-	fzfBin := ui.FindFzf()
 	if fzfBin == "" {
+		if *applyFlag && !*dryRunFlag {
+			fmt.Fprintln(stderr, "Error: -apply requires fzf for candidate selection. Install fzf or use -dry-run.")
+			return 1
+		}
 		fmt.Fprintf(stderr, "\n[PLAN REPORT] fzf runtime binary not found. Standard text summary output below:\n\n")
-		for _, c := range candidates {
-			isNonDeletable := !c.CanDelete || c.ProposedAction == "report-only"
-			idTag := fmt.Sprintf("[%d]", c.ID)
+		for index, c := range candidates {
+			isNonDeletable := !c.CanDelete
+			idTag := fmt.Sprintf("[%d]", index+1)
 			paddedID := fmt.Sprintf("%-5s", idTag)
 
-			abbrevPath := format.AbbreviateHomePath(c.Path)
-			var tags []string
-			if isNonDeletable {
-				tags = append(tags, "[CANNOT DELETE]")
-			}
-			if c.IsGitIgnored {
-				tags = append(tags, "[GITIGNORE]")
-			}
-			if c.IsDevBinary {
-				tags = append(tags, "[DEV BINARY]")
-			}
-			pathStr := abbrevPath
-			if len(tags) > 0 {
-				pathStr = strings.Join(tags, " ") + " " + abbrevPath
-			}
-			fmt.Fprintf(stdout, " %s [%-14s | %-16s] %10s | %s | %s\n", paddedID, c.RiskClass, c.Category, ui.FormatBytes(c.Size), format.FormatAgeDays(c.AgeDays), pathStr)
+			fmt.Fprintf(stdout, " %s [%-14s | %-16s] %10s | %s | %s\n", paddedID, c.RiskClass, c.Category, format.FormatBytes(c.Size), format.FormatAgeDays(c.AgeDays), ui.CandidatePath(c, isNonDeletable))
 		}
-		fmt.Fprintf(stdout, "\nTotal candidates: %d (%s)\n", len(candidates), ui.FormatBytes(totalCandidatesSizeBytes))
+		fmt.Fprintf(stdout, "\nTotal candidates: %d (%s)\n", len(candidates), format.FormatBytes(totalCandidatesSizeBytes))
+		if scanErr != nil {
+			return 1
+		}
 		return 0
 	}
 
-	selected := ui.RunFzfInteractive(candidates, fzfBin, diskTotal, diskUsed, diskFree)
+	if worktreeTab {
+		*next = []string{"repos"}
+		for _, path := range paths {
+			*next = append(*next, "-path", path)
+		}
+		return 0
+	}
 
 	isDryRun := *dryRunFlag || !*applyFlag
 	useTrash := *trashFlag && !*forcePermanentFlag
-	res := executor.ConfirmAndDeleteWithIO(selected, isDryRun, useTrash, *applyDataFlag, stdin, stdout, stderr, diskTotal, diskUsed, diskFree, manifest)
-	if len(res.Errors) > 0 {
+	res := executor.ConfirmAndDeleteWithIO(selected, isDryRun, useTrash, *applyDataFlag, stdin, stdout, stderr, diskUsed, manifest)
+	if len(res.Errors) > 0 || scanErr != nil {
 		return 1
 	}
 	return 0

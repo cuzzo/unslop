@@ -8,7 +8,47 @@
       "target": "any",
       "patterns": ["*.exe", "*.out", "a.out", "*.dylib", "*.so", "*.dll", "*.o", "*.a", "*.elf"],
       "category": "Dev Binary",
+      "risk_class": "unknown"
+    },
+    {
+      "id": "pi_sessions",
+      "name": "pi Sessions",
+      "target": "file",
+      "patterns": ["~/.pi/agent/sessions/*/*.jsonl"],
+      "category": "Agent Session",
+      "risk_class": "user-data"
+    },
+    {
+      "id": "antigravity_sessions",
+      "name": "Antigravity Conversations & Artifacts",
+      "target": "any",
+      "patterns": ["~/.gemini/antigravity/brain/*", "~/.gemini/antigravity/conversations", "~/.gemini/antigravity-cli/brain/*", "~/.gemini/antigravity-cli/conversations", "~/.gemini/antigravity-ide/brain/*", "~/.gemini/antigravity-ide/conversations", "~/.gemini/antigravity-backup/brain/*", "~/.gemini/antigravity-backup/conversations"],
+      "category": "Agent Session",
+      "risk_class": "user-data"
+    },
+    {
+      "id": "antigravity_memory",
+      "name": "Antigravity Context Memory",
+      "target": "dir",
+      "patterns": ["~/.gemini/antigravity/implicit", "~/.gemini/antigravity-cli/implicit", "~/.gemini/antigravity-ide/implicit", "~/.gemini/antigravity-backup/implicit"],
+      "category": "Agent Memory",
+      "risk_class": "user-data"
+    },
+    {
+      "id": "xcode_derived_data",
+      "name": "Xcode Derived Data",
+      "target": "dir",
+      "patterns": ["~/Library/Developer/Xcode/DerivedData"],
+      "category": "Build Cache",
       "risk_class": "regenerable"
+    },
+    {
+      "id": "homebrew_cache",
+      "name": "Homebrew Download Cache (use brew cleanup)",
+      "target": "dir",
+      "patterns": ["~/Library/Caches/Homebrew"],
+      "category": "Homebrew Cache",
+      "risk_class": "package-managed"
     },
     {
       "id": "zig_cache",
@@ -76,7 +116,7 @@
       "id": "tool_cache_tmp",
       "name": "Known Tool Cache Temp",
       "target": "dir",
-      "patterns": ["*/.cache/*", "*/.local/tmp/*", "*/.cargo/tmp/*"],
+      "patterns": ["*/.local/tmp/*", "*/.cargo/tmp/*"],
       "category": "Tool Temp Cache",
       "risk_class": "regenerable"
     },
@@ -84,7 +124,7 @@
       "id": "llm_models",
       "name": "LLM Models & Weights",
       "target": "any",
-      "patterns": ["*.gguf", "*.safetensors", "*.ckpt", "*.gexf", "*.llamafile", ".ollama/models", ".cache/huggingface/hub", ".lmstudio/models", ".cache/lm-studio", "jan/models", ".cache/llama.cpp"],
+      "patterns": ["*.gguf", "*.safetensors", "*.ckpt", "*.gexf", "*.llamafile", "~/.ollama/models", "~/.cache/huggingface/hub", "~/.lmstudio/models", "~/.cache/lm-studio", "jan/models", "~/.cache/llama.cpp"],
       "category": "LLM Model",
       "risk_class": "user-data"
     },
@@ -92,7 +132,7 @@
       "id": "agent_sessions",
       "name": "AI Agent Sessions",
       "target": "any",
-      "patterns": ["rollout-*.jsonl", ".codex/sessions", ".gemini/antigravity-cli/conversations"],
+      "patterns": ["rollout-*.jsonl", "~/.codex/sessions"],
       "category": "Agent Session",
       "risk_class": "user-data"
     },
@@ -100,7 +140,7 @@
       "id": "cursor_workspace_storage",
       "name": "Cursor Workspace Storage",
       "target": "dir",
-      "patterns": [".config/Cursor/User/workspaceStorage"],
+      "patterns": ["~/.config/Cursor/User/workspaceStorage", "~/Library/Application Support/Cursor/User/workspaceStorage"],
       "category": "Cursor Workspace Storage",
       "risk_class": "user-data"
     },
@@ -108,7 +148,7 @@
       "id": "agent_cache",
       "name": "AI Agent Caches",
       "target": "dir",
-      "patterns": [".codex/cache", ".codex/tmp", ".codex/.tmp", ".claude/cache", ".claude/paste-cache", ".gemini/antigravity-cli/cache", ".gemini/antigravity-cli/implicit", ".config/Cursor/Cache", ".config/Cursor/GPUCache"],
+      "patterns": ["~/.codex/cache", "~/.codex/tmp", "~/.codex/.tmp", "~/.claude/cache", "~/.claude/paste-cache", "~/.gemini/antigravity-cli/cache", "~/.config/Cursor/Cache", "~/.config/Cursor/GPUCache", "~/Library/Application Support/Cursor/Cache", "~/Library/Application Support/Cursor/GPUCache"],
       "category": "Agent Cache",
       "risk_class": "regenerable"
     },
@@ -116,15 +156,7 @@
       "id": "agent_logs",
       "name": "AI & IDE Logs",
       "target": "any",
-      "patterns": [
-        ".claude/debug",
-        ".gemini/antigravity-cli/log",
-        ".gemini/antigravity-cli/crashes",
-        ".config/Cursor/logs",
-        ".config/Code/logs",
-        "Library/Application Support/Code/logs",
-        "Library/Application Support/Cursor/logs"
-      ],
+      "patterns": ["~/.claude/debug", "~/.gemini/antigravity-cli/log", "~/.gemini/antigravity-cli/crashes", "~/.config/Cursor/logs", "~/.config/Code/logs", "~/Library/Application Support/Code/logs", "~/Library/Application Support/Cursor/logs"],
       "category": "IDE & AI Log",
       "risk_class": "user-data"
     },
@@ -132,11 +164,7 @@
       "id": "system_app_logs",
       "name": "System & Application Logs",
       "target": "any",
-      "patterns": [
-        "Library/Logs",
-        ".local/share/logs",
-        ".local/share/xorg"
-      ],
+      "patterns": ["~/Library/Logs", ".local/share/logs", ".local/share/xorg"],
       "category": "System/App Log",
       "risk_class": "user-data"
     },
@@ -144,15 +172,7 @@
       "id": "devops_container_logs",
       "name": "DevOps & Rotated Logs",
       "target": "any",
-      "patterns": [
-        "npm-debug.log*",
-        "yarn-error.log*",
-        "pnpm-debug.log*",
-        "*.log.gz",
-        "*.log.1",
-        "*.log.2",
-        "*.log.old"
-      ],
+      "patterns": ["npm-debug.log*", "yarn-error.log*", "pnpm-debug.log*", "*.log.gz", "*.log.1", "*.log.2", "*.log.old"],
       "category": "DevOps/Rotated Log",
       "risk_class": "user-data"
     },
@@ -160,7 +180,7 @@
       "id": "agent_history",
       "name": "AI Agent File History",
       "target": "any",
-      "patterns": [".claude/file-history"],
+      "patterns": ["~/.claude/file-history"],
       "category": "Agent History",
       "risk_class": "user-data"
     },

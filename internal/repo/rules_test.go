@@ -26,6 +26,7 @@ func TestRulesClassification(t *testing.T) {
 		{"build/release.exe", false, true, false, true},
 		{"archive/backup.zip", false, false, false, true},
 		{"assets/image.png", false, false, false, true},
+		{"installer.pkg", false, false, false, true},
 	}
 
 	for _, tt := range tests {
@@ -33,8 +34,8 @@ func TestRulesClassification(t *testing.T) {
 			if got := IsDebugBinary(tt.path); got != tt.expectedDebug {
 				t.Errorf("IsDebugBinary(%q) = %v; want %v", tt.path, got, tt.expectedDebug)
 			}
-			if got := IsDependencyDumpPath(tt.path); got != tt.expectedDep {
-				t.Errorf("IsDependencyDumpPath(%q) = %v; want %v", tt.path, got, tt.expectedDep)
+			if got := ExtractDependencyRoot(tt.path) != ""; got != tt.expectedDep {
+				t.Errorf("dependency root for %q: %v; want %v", tt.path, got, tt.expectedDep)
 			}
 			if got := IsGarbageDumpPath(tt.path); got != tt.expectedGarbage {
 				t.Errorf("IsGarbageDumpPath(%q) = %v; want %v", tt.path, got, tt.expectedGarbage)
@@ -56,37 +57,37 @@ func TestExtractDependencyRoot(t *testing.T) {
 }
 
 func TestClassifyCandidate(t *testing.T) {
-	cat, debug, risk := ClassifyCandidate("debug.pdb", true, false, 100)
+	cat, debug, risk := ClassifyCandidate("debug.pdb", true, false)
 	if cat != "Debug Binary" || !debug || risk != "history-bloat" {
 		t.Errorf("ClassifyCandidate(debug.pdb) = (%q, %v, %q)", cat, debug, risk)
 	}
 
-	cat, debug, _ = ClassifyCandidate("node_modules/pkg.js", false, false, 100)
+	cat, debug, _ = ClassifyCandidate("node_modules/pkg.js", false, false)
 	if cat != "Dependency Dump" || debug {
 		t.Errorf("ClassifyCandidate(node_modules) = (%q, %v)", cat, debug)
 	}
 
-	cat, _, _ = ClassifyCandidate("deleted.txt", true, true, 100)
+	cat, _, _ = ClassifyCandidate("deleted.txt", true, true)
 	if cat != "Deleted Then Ignored" {
 		t.Errorf("ClassifyCandidate(deleted.txt) = %q; want 'Deleted Then Ignored'", cat)
 	}
 
-	cat, _, _ = ClassifyCandidate("data_dump.json", true, false, 100)
+	cat, _, _ = ClassifyCandidate("data_dump.json", true, false)
 	if cat != "Garbage JSON Dump" {
 		t.Errorf("ClassifyCandidate(data_dump.json) = %q", cat)
 	}
 
-	cat, _, _ = ClassifyCandidate("scratch.tmp", true, false, 100)
+	cat, _, _ = ClassifyCandidate("scratch.tmp", true, false)
 	if cat != "Garbage File" {
 		t.Errorf("ClassifyCandidate(scratch.tmp) = %q", cat)
 	}
 
-	cat, _, _ = ClassifyCandidate("archive.zip", false, false, 100)
+	cat, _, _ = ClassifyCandidate("archive.zip", false, false)
 	if cat != "Large Binary" {
 		t.Errorf("ClassifyCandidate(archive.zip) = %q", cat)
 	}
 
-	cat, _, _ = ClassifyCandidate("old.unknown", true, false, 100)
+	cat, _, _ = ClassifyCandidate("old.unknown", true, false)
 	if cat != "Deleted File Bloat" {
 		t.Errorf("ClassifyCandidate(old.unknown) = %q; want 'Deleted File Bloat'", cat)
 	}
@@ -96,7 +97,7 @@ func TestIsSourceCodeFile(t *testing.T) {
 	codeFiles := []string{
 		"main.go", "lib.rs", "app.py", "index.js", "types.ts",
 		"server.cpp", "header.h", "Class.java", "script.sh",
-		"Makefile", "CMakeLists.txt", "Cargo.toml", "README.md",
+		"Makefile", "CMakeLists.txt", "Cargo.toml", "README.md", "main.lua", "main.zig", "index.html",
 	}
 
 	for _, f := range codeFiles {

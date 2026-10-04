@@ -12,7 +12,7 @@ import (
 	"github.com/yahn/unslop/internal/ui"
 )
 
-func runRepoSubcommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func runRepoSubcommand(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("unslop repo", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
@@ -52,20 +52,17 @@ func runRepoSubcommand(args []string, stdin io.Reader, stdout, stderr io.Writer)
 		return 1
 	}
 
-	analyzer := repo.NewGitAnalyzer()
-	if !analyzer.Detect(absPath) {
+	if !repo.Detect(absPath) {
 		fmt.Fprintf(stderr, "Error: directory '%s' is not a valid Git repository.\n", absPath)
 		return 1
 	}
 
 	opts := repo.ScanOptions{
-		MinSizeMB:      chosenMinSize,
-		NonInteractive: *nonInteractiveFlag,
-		OutputFile:     *outputFlag,
-		Stderr:         stderr,
+		MinSizeMB: chosenMinSize,
+		Stderr:    stderr,
 	}
 
-	candidates, err := analyzer.AnalyzeHistory(absPath, opts)
+	candidates, err := repo.AnalyzeHistory(absPath, opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error scanning Git history: %v\n", err)
 		return 1

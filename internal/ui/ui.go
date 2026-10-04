@@ -12,16 +12,22 @@ import (
 	"github.com/yahn/unslop/internal/scanner"
 )
 
-func FormatBytes(b int64) string {
-	return format.FormatBytes(b)
-}
-
-func FormatUintBytes(b uint64) string {
-	return format.FormatUintBytes(b)
-}
-
-func FormatNumber(n int64) string {
-	return format.FormatNumber(n)
+func CandidatePath(c scanner.Candidate, cannotDelete bool) string {
+	var tags []string
+	if cannotDelete {
+		tags = append(tags, "[CANNOT DELETE]")
+	}
+	if c.IsGitIgnored {
+		tags = append(tags, "[GITIGNORE]")
+	}
+	if c.IsDevBinary {
+		tags = append(tags, "[DEV BINARY]")
+	}
+	path := format.AbbreviateHomePath(c.Path)
+	if len(tags) > 0 {
+		path = strings.Join(tags, " ") + " " + path
+	}
+	return path
 }
 
 func RenderProgressBar(percentage float64, width int) string {
@@ -67,60 +73,32 @@ func FindFzf() string {
 	return ""
 }
 
-func RunFzfInteractive(candidates []scanner.Candidate, fzfBin string, diskTotal, diskUsed, diskFree uint64) []scanner.Candidate {
-	if len(candidates) == 0 {
-		fmt.Fprintf(os.Stderr, "No stale candidates found matching criteria.\n")
-		return nil
-	}
-
-	var totalSizeBytes int64
-	for _, c := range candidates {
-		totalSizeBytes += c.Size
-	}
-
+func fileRows(candidates []scanner.Candidate) (bytes.Buffer, map[string]scanner.Candidate) {
 	candMap := make(map[string]scanner.Candidate, len(candidates))
 	var inputBuf bytes.Buffer
 
-	for _, c := range candidates {
-		token := fmt.Sprintf("cand-%d", c.ID)
+	for index, c := range candidates {
+		token := fmt.Sprintf("cand-%d", index+1)
 		candMap[token] = c
 
-		sanitizedPath := SanitizeTerminalString(c.Path)
-		abbrevPath := format.AbbreviateHomePath(sanitizedPath)
+		c.Path = SanitizeTerminalString(c.Path)
 		sanitizedCategory := SanitizeTerminalString(c.Category)
 
-		idTag := fmt.Sprintf("[%d]", c.ID)
+		idTag := fmt.Sprintf("[%d]", index+1)
 		paddedID := fmt.Sprintf("%-5s", idTag)
-		isNonDeletable := !c.CanDelete || c.ProposedAction == "report-only"
+		isNonDeletable := !c.CanDelete
 
-		var tags []string
-		if isNonDeletable {
-			tags = append(tags, "[CANNOT DELETE]")
-		}
-		if c.IsGitIgnored {
-			tags = append(tags, "[GITIGNORE]")
-		}
-		if c.IsDevBinary {
-			tags = append(tags, "[DEV BINARY]")
-		}
-
-		pathWithTags := abbrevPath
-		if len(tags) > 0 {
-			pathWithTags = strings.Join(tags, " ") + " " + abbrevPath
-		}
-
-		displayLine := fmt.Sprintf("%s %10s | %s | %-16s | %s", paddedID, FormatBytes(c.Size), format.FormatAgeDays(c.AgeDays), sanitizedCategory, pathWithTags)
-
-		inputBuf.WriteString(token)
-		inputBuf.WriteByte('\t')
-		inputBuf.WriteString(displayLine)
-		inputBuf.WriteByte(0)
+		fmt.Fprintf(&inputBuf, "%s\t%s %10s | %s | %-16s | %s\x00", token, paddedID, format.FormatBytes(c.Size), format.FormatAgeDays(c.AgeDays), sanitizedCategory, CandidatePath(c, isNonDeletable))
 	}
 
+	return inputBuf, candMap
+}
+
+func fileSelector(fzfBin string, diskTotal, diskUsed, diskFree uint64) *exec.Cmd {
+
 	headerStr := fmt.Sprintf(
-		"unslop v%s | Total: %s | Used: %s | Free: %s | Candidates: %d (%s)\nControls: TAB: Select & Next | Shift-TAB: Select & Prev | Backspace/Del: Unselect & Prev | Ctrl-A: Select All | Enter: Confirm Selection",
-		config.Version, FormatUintBytes(diskTotal), FormatUintBytes(diskUsed), FormatUintBytes(diskFree),
-		len(candidates), FormatBytes(totalSizeBytes),
+		"[Files] (f) | Repos (r)\nunslop v%s | Total: %s | Used: %s | Free: %s\nControls: /: Search | TAB: Select & Next | Shift-TAB: Select & Prev | Backspace/Del: Unselect & Prev | Ctrl-A: Select All | Enter: Confirm Selection",
+		config.Version, format.FormatUintBytes(diskTotal), format.FormatUintBytes(diskUsed), format.FormatUintBytes(diskFree),
 	)
 
 	cmd := exec.Command(fzfBin,
@@ -129,55 +107,59 @@ func RunFzfInteractive(candidates []scanner.Candidate, fzfBin string, diskTotal,
 		"--multi",
 		"--read0",
 		"--print0",
+		"--expect=ctrl-w",
 		"--delimiter=\t",
 		"--with-nth=2..",
 		"--header="+headerStr,
 		"--prompt=Select items to clean> ",
-		"--bind=tab:toggle+down,btab:toggle+up,bspace:deselect+up,bs:deselect+up,delete:deselect+up,del:deselect+up,ctrl-a:select-all",
+		"--bind=r:print(r)+accept,/:unbind(r)+change-prompt(Search files> ),tab:toggle+down,btab:toggle+up,bspace:deselect+up,bs:deselect+up,delete:deselect+up,del:deselect+up,ctrl-a:select-all",
 		"--pointer=❯ ",
 		"--marker=x ",
 		"--color=fg:white,hl:yellow,pointer:cyan,marker:red",
 	)
 
-	cmd.Stdin = &inputBuf
 	cmd.Stderr = os.Stderr
+	return cmd
+}
 
-	outBytes, err := cmd.Output()
+func selectedFiles(outBytes []byte, err error, candMap map[string]scanner.Candidate) ([]scanner.Candidate, bool, error) {
+	tokens := SelectionTokens(outBytes)
+	if tokens[0] == "r" || tokens[0] == "ctrl-w" {
+		return nil, true, nil
+	}
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			if exitErr.ExitCode() == 130 || exitErr.ExitCode() == 1 {
 				fmt.Fprintln(os.Stderr, "Selection cancelled.")
-				return nil
+				return nil, false, nil
 			}
 		}
-		fmt.Fprintf(os.Stderr, "Error executing fzf: %v\n", err)
-		return nil
+		return nil, false, err
 	}
 
 	if len(outBytes) == 0 {
-		return nil
+		return nil, false, nil
 	}
 
-	lines := bytes.Split(outBytes, []byte{0})
 	var selected []scanner.Candidate
 
-	for _, line := range lines {
-		if len(line) == 0 {
-			continue
-		}
-		strLine := string(line)
-		idx := strings.IndexByte(strLine, '\t')
-		token := strLine
-		if idx != -1 {
-			token = strLine[:idx]
-		}
-		token = strings.TrimSpace(token)
+	for _, token := range tokens {
 		if cand, ok := candMap[token]; ok {
-			if cand.CanDelete && cand.ProposedAction != "report-only" {
+			if cand.CanDelete {
 				selected = append(selected, cand)
 			}
 		}
 	}
 
-	return selected
+	return selected, false, nil
+}
+
+func SelectionTokens(output []byte) []string {
+	fields := bytes.Split(bytes.TrimPrefix(output, []byte{0}), []byte{0})
+	tokens := make([]string, len(fields))
+	for index, field := range fields {
+		token, _, _ := strings.Cut(string(field), "\t")
+		tokens[index] = strings.TrimSpace(token)
+	}
+	return tokens
 }

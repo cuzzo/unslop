@@ -1,11 +1,69 @@
 package repo
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+func TestHistoryOutputContract(t *testing.T) {
+	dir := createTestGitRepo(t)
+	defer os.RemoveAll(dir)
+	expected := map[string]HistoryCandidate{
+		"app.pdb":         {Size: int64(len("DEBUG SYMBOLS CONTENT")), Category: "Debug Binary", Status: "existing", IsDebug: true, CommitCount: 1},
+		"node_modules/":   {Size: int64(len("console.log('test')")), Category: "Dependency Dump", Status: "existing", CommitCount: 1},
+		"temp_data.bin":   {Size: int64(len("TEMP BINARY CONTENT")), Category: "Deleted Then Ignored", Status: "deleted", CommitCount: 2},
+		"trace_dump.json": {Size: int64(len(`{"trace": [1, 2, 3]}`)), Category: "Deleted Then Ignored", Status: "deleted", CommitCount: 2},
+	}
+	for _, minSize := range []float64{0, 0.5} {
+		candidates, err := AnalyzeHistory(dir, ScanOptions{MinSizeMB: minSize, Stderr: io.Discard})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantCount := len(expected)
+		if minSize > 0 {
+			wantCount--
+		}
+		if len(candidates) != wantCount {
+			t.Fatalf("min-size=%v candidates=%+v", minSize, candidates)
+		}
+		for index, candidate := range candidates {
+			want, found := expected[candidate.Path]
+			want.ID, want.Path, want.RiskClass, want.CanDelete = index+1, candidate.Path, "history-bloat", true
+			if !found || candidate != want {
+				t.Fatalf("min-size=%v got %+v want %+v", minSize, candidate, want)
+			}
+		}
+	}
+}
+
+func TestDeletedDependencyHistoryRemainsAnAggregate(t *testing.T) {
+	dir := createTestGitRepo(t)
+	defer os.RemoveAll(dir)
+	cmd := exec.Command("git", "-C", dir, "rm", "-r", "node_modules")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s %v", output, err)
+	}
+	cmd = exec.Command("git", "-C", dir, "-c", "commit.gpgsign=false", "commit", "-m", "remove dependencies")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s %v", output, err)
+	}
+	items, err := AnalyzeHistory(dir, ScanOptions{Stderr: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if item.Path == "node_modules/" {
+			if item.Size != 10*1024*1024 || item.Category != "Dependency Dump" || item.Status != "deleted" || item.CommitCount != 2 {
+				t.Fatalf("deleted aggregate changed: %+v", item)
+			}
+			return
+		}
+	}
+	t.Fatal("deleted dependency aggregate missing")
+}
 
 func createTestGitRepo(t *testing.T) string {
 	t.Helper()
@@ -64,19 +122,13 @@ func TestGitAnalyzer(t *testing.T) {
 	repoDir := createTestGitRepo(t)
 	defer os.RemoveAll(repoDir)
 
-	analyzer := NewGitAnalyzer()
-
-	if analyzer.Kind() != VCSGit {
-		t.Errorf("Kind() = %v; want git", analyzer.Kind())
-	}
-
-	if !analyzer.Detect(repoDir) {
+	if !Detect(repoDir) {
 		t.Errorf("Detect(%q) = false; want true", repoDir)
 	}
 
 	nonRepoDir, _ := os.MkdirTemp("", "non-git-*")
 	defer os.RemoveAll(nonRepoDir)
-	if analyzer.Detect(nonRepoDir) {
+	if Detect(nonRepoDir) {
 		t.Errorf("Detect(%q) = true; want false", nonRepoDir)
 	}
 
@@ -84,7 +136,7 @@ func TestGitAnalyzer(t *testing.T) {
 		MinSizeMB: 0.0,
 	}
 
-	candidates, err := analyzer.AnalyzeHistory(repoDir, opts)
+	candidates, err := AnalyzeHistory(repoDir, opts)
 	if err != nil {
 		t.Fatalf("AnalyzeHistory failed: %v", err)
 	}
@@ -132,8 +184,7 @@ func TestGitAnalyzerNonRepoError(t *testing.T) {
 	nonRepoDir, _ := os.MkdirTemp("", "non-git-*")
 	defer os.RemoveAll(nonRepoDir)
 
-	analyzer := NewGitAnalyzer()
-	_, err := analyzer.AnalyzeHistory(nonRepoDir, ScanOptions{})
+	_, err := AnalyzeHistory(nonRepoDir, ScanOptions{})
 	if err == nil {
 		t.Errorf("Expected error for non-repo directory, got nil")
 	}

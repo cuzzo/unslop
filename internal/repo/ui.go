@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 
 	"github.com/yahn/unslop/internal/format"
 	"github.com/yahn/unslop/internal/ui"
@@ -41,19 +40,8 @@ func RunRepoUI(candidates []HistoryCandidate, fzfBin string, nonInteractive bool
 			idTag := fmt.Sprintf("[%d]", c.ID)
 			paddedID := fmt.Sprintf("%-5s", idTag)
 
-			var tags []string
-			if c.IsDebug {
-				tags = append(tags, "[DEBUG BINARY]")
-			}
-			if c.Status == "deleted" {
-				tags = append(tags, "[DELETED]")
-			} else {
-				tags = append(tags, "[EXISTING]")
-			}
-
-			tagStr := strings.Join(tags, " ")
 			fmt.Fprintf(stdout, " %s [%-16s | %-20s] %10s | %s %s\n",
-				paddedID, c.RiskClass, c.Category, format.FormatBytes(c.Size), tagStr, c.Path)
+				paddedID, c.RiskClass, c.Category, format.FormatBytes(c.Size), historyTags(c), c.Path)
 		}
 		// In non-interactive or non-fzf mode, select all candidates for manifest generation
 		return candidates
@@ -72,27 +60,9 @@ func RunRepoUI(candidates []HistoryCandidate, fzfBin string, nonInteractive bool
 		idTag := fmt.Sprintf("[%d]", c.ID)
 		paddedID := fmt.Sprintf("%-5s", idTag)
 
-		var tags []string
-		if c.IsDebug {
-			tags = append(tags, "[DEBUG BINARY]")
-		}
-		if c.Status == "deleted" {
-			tags = append(tags, "[DELETED]")
-		} else {
-			tags = append(tags, "[EXISTING]")
-		}
+		pathWithTags := historyTags(c) + " " + sanitizedPath
 
-		pathWithTags := sanitizedPath
-		if len(tags) > 0 {
-			pathWithTags = strings.Join(tags, " ") + " " + sanitizedPath
-		}
-
-		displayLine := fmt.Sprintf("%s %10s | %-16s | %s", paddedID, format.FormatBytes(c.Size), sanitizedCategory, pathWithTags)
-
-		inputBuf.WriteString(token)
-		inputBuf.WriteByte('\t')
-		inputBuf.WriteString(displayLine)
-		inputBuf.WriteByte(0)
+		fmt.Fprintf(&inputBuf, "%s\t%s %10s | %-16s | %s\x00", token, paddedID, format.FormatBytes(c.Size), sanitizedCategory, pathWithTags)
 	}
 
 	headerStr := fmt.Sprintf(
@@ -135,24 +105,24 @@ func RunRepoUI(candidates []HistoryCandidate, fzfBin string, nonInteractive bool
 		return nil
 	}
 
-	lines := bytes.Split(outBytes, []byte{0})
 	var selected []HistoryCandidate
 
-	for _, line := range lines {
-		if len(line) == 0 {
-			continue
-		}
-		strLine := string(line)
-		idx := strings.IndexByte(strLine, '\t')
-		token := strLine
-		if idx != -1 {
-			token = strLine[:idx]
-		}
-		token = strings.TrimSpace(token)
+	for _, token := range ui.SelectionTokens(outBytes) {
 		if cand, ok := candMap[token]; ok {
 			selected = append(selected, cand)
 		}
 	}
 
 	return selected
+}
+
+func historyTags(c HistoryCandidate) string {
+	tag := "[EXISTING]"
+	if c.Status == "deleted" {
+		tag = "[DELETED]"
+	}
+	if c.IsDebug {
+		tag = "[DEBUG BINARY] " + tag
+	}
+	return tag
 }

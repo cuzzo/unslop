@@ -48,10 +48,10 @@ type Rule struct {
 }
 
 type Manifest struct {
-	Version           int     `json:"version,omitempty"`
-	DefaultDays       float64 `json:"default_days"`
+	Version          int     `json:"version,omitempty"`
+	DefaultDays      float64 `json:"default_days"`
 	DefaultMinSizeMB float64 `json:"default_min_size_mb"`
-	Rules             []Rule  `json:"rules"`
+	Rules            []Rule  `json:"rules"`
 }
 
 type RuleEngine struct {
@@ -67,85 +67,65 @@ func matchGlob(pattern, name string) bool {
 		return true
 	}
 	matched, err := filepath.Match(pattern, name)
-	if err == nil && matched {
-		return true
-	}
-	return false
+	return err == nil && matched
 }
 
-func hasMarkerFile(dirPath string, markerFiles []string) bool {
-	if len(markerFiles) == 0 {
+func matchPathPattern(pattern, name, fullPath string) bool {
+	pattern = filepath.FromSlash(pattern)
+	if !strings.ContainsRune(pattern, filepath.Separator) {
+		return matchGlob(pattern, name)
+	}
+	if strings.HasPrefix(pattern, "~"+string(filepath.Separator)) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return false
+		}
+		pattern = filepath.Join(home, pattern[2:])
+	}
+	if filepath.IsAbs(pattern) {
+		absolute, err := filepath.Abs(fullPath)
+		return err == nil && matchGlob(pattern, absolute)
+	}
+	for candidate := filepath.Clean(fullPath); ; {
+		if matchGlob(pattern, candidate) {
+			return true
+		}
+		_, suffix, found := strings.Cut(candidate, string(filepath.Separator))
+		if !found {
+			return false
+		}
+		candidate = suffix
+	}
+}
+
+func hasMarkerFiles(directory string, markers []string) bool {
+	if len(markers) == 0 {
 		return true
 	}
-	parent := filepath.Dir(dirPath)
-	for _, mf := range markerFiles {
-		mfPath := filepath.Join(parent, mf)
-		if _, err := os.Lstat(mfPath); err == nil {
+	for _, marker := range markers {
+		if _, err := os.Lstat(filepath.Join(directory, marker)); err == nil {
 			return true
 		}
 	}
 	return false
 }
 
-func hasInternalMarkerFile(dirPath string, internalMarkerFiles []string) bool {
-	if len(internalMarkerFiles) == 0 {
-		return true
+func (e *RuleEngine) Match(name, fullPath string, isDir bool) *Rule {
+	target := "file"
+	if isDir {
+		target = "dir"
 	}
-	for _, imf := range internalMarkerFiles {
-		imfPath := filepath.Join(dirPath, imf)
-		if _, err := os.Lstat(imfPath); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
-func (e *RuleEngine) MatchDir(dirName, fullPath string, pkgInventory map[string]string) (*Rule, string, []string) {
 	for _, rule := range e.Rules {
-		if rule.Target != "dir" && rule.Target != "any" {
+		if rule.Target != target && rule.Target != "any" {
 			continue
 		}
-		for _, pat := range rule.Patterns {
-			if strings.Contains(pat, "/") {
-				if matchGlob(pat, fullPath) {
-					if hasMarkerFile(fullPath, rule.MarkerFiles) && hasInternalMarkerFile(fullPath, rule.InternalMarkerFiles) {
-						rCopy := rule
-						return &rCopy, "", nil
-					}
-				}
-			} else {
-				if matchGlob(pat, dirName) {
-					if hasMarkerFile(fullPath, rule.MarkerFiles) && hasInternalMarkerFile(fullPath, rule.InternalMarkerFiles) {
-						rCopy := rule
-						return &rCopy, "", nil
-					}
-				}
+		for _, pattern := range rule.Patterns {
+			if matchPathPattern(pattern, name, fullPath) && (!isDir || (hasMarkerFiles(filepath.Dir(fullPath), rule.MarkerFiles) && hasMarkerFiles(fullPath, rule.InternalMarkerFiles))) {
+				return &rule
 			}
 		}
 	}
-	return nil, "", nil
-}
-
-func (e *RuleEngine) MatchFile(fileName, fullPath string, fi os.FileInfo, pkgInventory map[string]string) (*Rule, string, []string) {
-	for _, rule := range e.Rules {
-		if rule.Target != "file" && rule.Target != "any" {
-			continue
-		}
-		for _, pat := range rule.Patterns {
-			if strings.Contains(pat, "/") {
-				if matchGlob(pat, fullPath) {
-					rCopy := rule
-					return &rCopy, "", nil
-				}
-			} else {
-				if matchGlob(pat, fileName) {
-					rCopy := rule
-					return &rCopy, "", nil
-				}
-			}
-		}
-	}
-	return nil, "", nil
+	return nil
 }
 
 func shouldWarnConflict(r1, r2 Rule) bool {
@@ -174,7 +154,6 @@ func validateManifest(m Manifest) error {
 		return fmt.Errorf("unsupported manifest version %d (supported max version: 1)", m.Version)
 	}
 
-	seenIDs := make(map[string]bool)
 	seenPatterns := make(map[string]string)
 	existingRuleByID := make(map[string]Rule)
 
@@ -182,10 +161,9 @@ func validateManifest(m Manifest) error {
 		if strings.TrimSpace(r.ID) == "" {
 			return fmt.Errorf("manifest rule contains empty 'id'")
 		}
-		if seenIDs[r.ID] {
+		if _, exists := existingRuleByID[r.ID]; exists {
 			return fmt.Errorf("duplicate rule ID '%s' found in manifest", r.ID)
 		}
-		seenIDs[r.ID] = true
 		existingRuleByID[r.ID] = r
 
 		if r.Target != "dir" && r.Target != "file" && r.Target != "any" {
@@ -278,7 +256,6 @@ func LoadManifest(customPath string) (Manifest, error) {
 }
 
 func CalculateDynamicMinSizeMB(diskTotalBytes uint64) float64 {
-	const minFloorMB = 0.1
 	const maxCapMB = 50.0
 
 	if diskTotalBytes == 0 {
@@ -295,14 +272,7 @@ func CalculateDynamicMinSizeMB(diskTotalBytes uint64) float64 {
 		return maxCapMB
 	}
 
-	scaledMB := diskGB * 0.05
-	if scaledMB < minFloorMB {
-		return minFloorMB
-	}
-	if scaledMB > maxCapMB {
-		return maxCapMB
-	}
-	return scaledMB
+	return diskGB * 0.05
 }
 
 func ApplyRuleOverrides(engine *RuleEngine, args []string) ([]string, []string) {
@@ -316,7 +286,7 @@ func ApplyRuleOverrides(engine *RuleEngine, args []string) ([]string, []string) 
 			for _, r := range engine.Rules {
 				matched := false
 				for _, p := range r.Patterns {
-					if p == pat || matchGlob(pat, p) {
+					if matchGlob(pat, p) {
 						matched = true
 						break
 					}
@@ -343,6 +313,5 @@ func ApplyRuleOverrides(engine *RuleEngine, args []string) ([]string, []string) 
 		}
 	}
 
-	*engine = *NewRuleEngine(Manifest{Rules: engine.Rules})
 	return removed, added
 }

@@ -1,0 +1,767 @@
+{
+  "declarations": {
+    "cmd/unslop/main.go:Set": {
+      "end": 29,
+      "lines": 4,
+      "start": 26
+    },
+    "cmd/unslop/main.go:String": {
+      "end": 24,
+      "lines": 3,
+      "start": 22
+    },
+    "cmd/unslop/main.go:main": {
+      "end": 33,
+      "lines": 3,
+      "start": 31
+    },
+    "cmd/unslop/main.go:multimodFlag": {
+      "end": 20,
+      "lines": 1,
+      "start": 20
+    },
+    "cmd/unslop/main.go:run": {
+      "end": 73,
+      "lines": 39,
+      "start": 35
+    },
+    "cmd/unslop/main.go:runFiles": {
+      "end": 292,
+      "lines": 211,
+      "start": 82
+    },
+    "cmd/unslop/main.go:splitCommand": {
+      "end": 80,
+      "lines": 6,
+      "start": 75
+    },
+    "cmd/unslop/repo.go:runRepoSubcommand": {
+      "end": 113,
+      "lines": 99,
+      "start": 15
+    },
+    "cmd/unslop/worktrees.go:runWorktreesSubcommand": {
+      "end": 102,
+      "lines": 88,
+      "start": 15
+    },
+    "internal/config/config.go:ApplyRuleOverrides": {
+      "end": 317,
+      "lines": 40,
+      "start": 278
+    },
+    "internal/config/config.go:CalculateDynamicMinSizeMB": {
+      "end": 276,
+      "lines": 19,
+      "start": 258
+    },
+    "internal/config/config.go:IsValid": {
+      "end": 35,
+      "lines": 8,
+      "start": 28
+    },
+    "internal/config/config.go:LoadManifest": {
+      "end": 256,
+      "lines": 31,
+      "start": 226
+    },
+    "internal/config/config.go:Manifest": {
+      "end": 55,
+      "lines": 6,
+      "start": 50
+    },
+    "internal/config/config.go:Match": {
+      "end": 129,
+      "lines": 17,
+      "start": 113
+    },
+    "internal/config/config.go:NewRuleEngine": {
+      "end": 63,
+      "lines": 3,
+      "start": 61
+    },
+    "internal/config/config.go:RiskClass": {
+      "end": 19,
+      "lines": 1,
+      "start": 19
+    },
+    "internal/config/config.go:Rule": {
+      "end": 48,
+      "lines": 12,
+      "start": 37
+    },
+    "internal/config/config.go:RuleEngine": {
+      "end": 59,
+      "lines": 3,
+      "start": 57
+    },
+    "internal/config/config.go:hasMarkerFiles": {
+      "end": 111,
+      "lines": 11,
+      "start": 101
+    },
+    "internal/config/config.go:matchGlob": {
+      "end": 71,
+      "lines": 7,
+      "start": 65
+    },
+    "internal/config/config.go:matchPathPattern": {
+      "end": 99,
+      "lines": 27,
+      "start": 73
+    },
+    "internal/config/config.go:readManifestBytes": {
+      "end": 224,
+      "lines": 30,
+      "start": 195
+    },
+    "internal/config/config.go:shouldWarnConflict": {
+      "end": 150,
+      "lines": 20,
+      "start": 131
+    },
+    "internal/config/config.go:validateManifest": {
+      "end": 193,
+      "lines": 42,
+      "start": 152
+    },
+    "internal/executor/executor.go:ConfirmAndDeleteWithIO": {
+      "end": 606,
+      "lines": 253,
+      "start": 354
+    },
+    "internal/executor/executor.go:ExecutionResult": {
+      "end": 43,
+      "lines": 6,
+      "start": 38
+    },
+    "internal/executor/executor.go:QuarantineJournalEntry": {
+      "end": 36,
+      "lines": 10,
+      "start": 27
+    },
+    "internal/executor/executor.go:RecoverOrphanedQuarantines": {
+      "end": 293,
+      "lines": 52,
+      "start": 242
+    },
+    "internal/executor/executor.go:createTrashInfo": {
+      "end": 323,
+      "lines": 11,
+      "start": 313
+    },
+    "internal/executor/executor.go:findUniqueTrashDest": {
+      "end": 311,
+      "lines": 17,
+      "start": 295
+    },
+    "internal/executor/executor.go:getJournalPath": {
+      "end": 56,
+      "lines": 10,
+      "start": 47
+    },
+    "internal/executor/executor.go:loadJournal": {
+      "end": 161,
+      "lines": 9,
+      "start": 153
+    },
+    "internal/executor/executor.go:loadJournalLocked": {
+      "end": 104,
+      "lines": 21,
+      "start": 84
+    },
+    "internal/executor/executor.go:moveToTrash": {
+      "end": 352,
+      "lines": 28,
+      "start": 325
+    },
+    "internal/executor/executor.go:recordQuarantineEntry": {
+      "end": 172,
+      "lines": 10,
+      "start": 163
+    },
+    "internal/executor/executor.go:removeJournalEntry": {
+      "end": 214,
+      "lines": 17,
+      "start": 198
+    },
+    "internal/executor/executor.go:rollbackQuarantine": {
+      "end": 240,
+      "lines": 25,
+      "start": 216
+    },
+    "internal/executor/executor.go:saveJournalLocked": {
+      "end": 151,
+      "lines": 46,
+      "start": 106
+    },
+    "internal/executor/executor.go:updateJournalEntryPhase": {
+      "end": 196,
+      "lines": 23,
+      "start": 174
+    },
+    "internal/executor/executor.go:withJournalLock": {
+      "end": 82,
+      "lines": 25,
+      "start": 58
+    },
+    "internal/format/format.go:AbbreviateHomePath": {
+      "end": 53,
+      "lines": 16,
+      "start": 38
+    },
+    "internal/format/format.go:FormatAgeDays": {
+      "end": 60,
+      "lines": 6,
+      "start": 55
+    },
+    "internal/format/format.go:FormatBytes": {
+      "end": 20,
+      "lines": 12,
+      "start": 9
+    },
+    "internal/format/format.go:FormatNumber": {
+      "end": 36,
+      "lines": 11,
+      "start": 26
+    },
+    "internal/format/format.go:FormatUintBytes": {
+      "end": 24,
+      "lines": 3,
+      "start": 22
+    },
+    "internal/platform/platform.go:ContainsMountOrReparsePoint": {
+      "end": 132,
+      "lines": 59,
+      "start": 74
+    },
+    "internal/platform/platform.go:ContainsProtectedPath": {
+      "end": 72,
+      "lines": 18,
+      "start": 55
+    },
+    "internal/platform/platform.go:IsAgentContainer": {
+      "end": 25,
+      "lines": 12,
+      "start": 14
+    },
+    "internal/platform/platform.go:IsProtected": {
+      "end": 53,
+      "lines": 27,
+      "start": 27
+    },
+    "internal/platform/platform_darwin.go:GetStatTimes": {
+      "end": 19,
+      "lines": 8,
+      "start": 12
+    },
+    "internal/platform/platform_darwin.go:MoveToTrashOS": {
+      "end": 28,
+      "lines": 8,
+      "start": 21
+    },
+    "internal/platform/platform_linux.go:GetStatTimes": {
+      "end": 20,
+      "lines": 8,
+      "start": 13
+    },
+    "internal/platform/platform_linux.go:MoveToTrashOS": {
+      "end": 34,
+      "lines": 13,
+      "start": 22
+    },
+    "internal/platform/platform_other.go:GetDiskSpace": {
+      "end": 29,
+      "lines": 3,
+      "start": 27
+    },
+    "internal/platform/platform_other.go:GetFileIdentity": {
+      "end": 17,
+      "lines": 3,
+      "start": 15
+    },
+    "internal/platform/platform_other.go:GetStatTimes": {
+      "end": 13,
+      "lines": 3,
+      "start": 11
+    },
+    "internal/platform/platform_other.go:LockFile": {
+      "end": 37,
+      "lines": 3,
+      "start": 35
+    },
+    "internal/platform/platform_other.go:MoveToTrashOS": {
+      "end": 33,
+      "lines": 3,
+      "start": 31
+    },
+    "internal/platform/platform_other.go:UnlockFile": {
+      "end": 41,
+      "lines": 3,
+      "start": 39
+    },
+    "internal/platform/platform_other.go:getDeviceID": {
+      "end": 21,
+      "lines": 3,
+      "start": 19
+    },
+    "internal/platform/platform_other.go:getDeviceIDFromInfo": {
+      "end": 25,
+      "lines": 3,
+      "start": 23
+    },
+    "internal/platform/platform_posix.go:GetDiskSpace": {
+      "end": 41,
+      "lines": 10,
+      "start": 32
+    },
+    "internal/platform/platform_posix.go:GetFileIdentity": {
+      "end": 15,
+      "lines": 6,
+      "start": 10
+    },
+    "internal/platform/platform_posix.go:LockFile": {
+      "end": 45,
+      "lines": 3,
+      "start": 43
+    },
+    "internal/platform/platform_posix.go:UnlockFile": {
+      "end": 49,
+      "lines": 3,
+      "start": 47
+    },
+    "internal/platform/platform_posix.go:getDeviceID": {
+      "end": 23,
+      "lines": 7,
+      "start": 17
+    },
+    "internal/platform/platform_posix.go:getDeviceIDFromInfo": {
+      "end": 30,
+      "lines": 6,
+      "start": 25
+    },
+    "internal/platform/platform_windows.go:GetDiskSpace": {
+      "end": 90,
+      "lines": 23,
+      "start": 68
+    },
+    "internal/platform/platform_windows.go:GetFileIdentity": {
+      "end": 58,
+      "lines": 29,
+      "start": 30
+    },
+    "internal/platform/platform_windows.go:GetStatTimes": {
+      "end": 15,
+      "lines": 3,
+      "start": 13
+    },
+    "internal/platform/platform_windows.go:LockFile": {
+      "end": 126,
+      "lines": 18,
+      "start": 109
+    },
+    "internal/platform/platform_windows.go:MoveToTrashOS": {
+      "end": 96,
+      "lines": 5,
+      "start": 92
+    },
+    "internal/platform/platform_windows.go:UnlockFile": {
+      "end": 144,
+      "lines": 17,
+      "start": 128
+    },
+    "internal/platform/platform_windows.go:byHandleFileInformation": {
+      "end": 28,
+      "lines": 12,
+      "start": 17
+    },
+    "internal/platform/platform_windows.go:getDeviceID": {
+      "end": 62,
+      "lines": 3,
+      "start": 60
+    },
+    "internal/platform/platform_windows.go:getDeviceIDFromInfo": {
+      "end": 66,
+      "lines": 3,
+      "start": 64
+    },
+    "internal/repo/git.go:AnalyzeHistory": {
+      "end": 189,
+      "lines": 160,
+      "start": 30
+    },
+    "internal/repo/git.go:Detect": {
+      "end": 21,
+      "lines": 4,
+      "start": 18
+    },
+    "internal/repo/git.go:fileHistoryStats": {
+      "end": 28,
+      "lines": 6,
+      "start": 23
+    },
+    "internal/repo/git.go:populateFileSizes": {
+      "end": 237,
+      "lines": 47,
+      "start": 191
+    },
+    "internal/repo/rules.go:ClassifyCandidate": {
+      "end": 110,
+      "lines": 32,
+      "start": 79
+    },
+    "internal/repo/rules.go:ExtractDependencyRoot": {
+      "end": 52,
+      "lines": 9,
+      "start": 44
+    },
+    "internal/repo/rules.go:IsDebugBinary": {
+      "end": 28,
+      "lines": 21,
+      "start": 8
+    },
+    "internal/repo/rules.go:IsGarbageDumpPath": {
+      "end": 77,
+      "lines": 16,
+      "start": 62
+    },
+    "internal/repo/rules.go:IsLargeBinaryExtension": {
+      "end": 42,
+      "lines": 13,
+      "start": 30
+    },
+    "internal/repo/rules.go:IsSourceCodeFile": {
+      "end": 143,
+      "lines": 32,
+      "start": 112
+    },
+    "internal/repo/rules.go:isDependencyDir": {
+      "end": 60,
+      "lines": 7,
+      "start": 54
+    },
+    "internal/repo/ui.go:RunRepoUI": {
+      "end": 117,
+      "lines": 103,
+      "start": 15
+    },
+    "internal/repo/ui.go:historyTags": {
+      "end": 128,
+      "lines": 10,
+      "start": 119
+    },
+    "internal/repo/vcs.go:HistoryCandidate": {
+      "end": 15,
+      "lines": 11,
+      "start": 5
+    },
+    "internal/repo/vcs.go:ScanOptions": {
+      "end": 20,
+      "lines": 4,
+      "start": 17
+    },
+    "internal/repo/writer.go:FormatInstructions": {
+      "end": 58,
+      "lines": 18,
+      "start": 41
+    },
+    "internal/repo/writer.go:WriteFilterManifest": {
+      "end": 38,
+      "lines": 27,
+      "start": 12
+    },
+    "internal/scanner/scanner.go:Candidate": {
+      "end": 34,
+      "lines": 16,
+      "start": 19
+    },
+    "internal/scanner/scanner.go:GetDefaultScanDirs": {
+      "end": 42,
+      "lines": 7,
+      "start": 36
+    },
+    "internal/scanner/scanner.go:GetEffectiveItemTime": {
+      "end": 71,
+      "lines": 17,
+      "start": 55
+    },
+    "internal/scanner/scanner.go:InspectSubtree": {
+      "end": 174,
+      "lines": 50,
+      "start": 125
+    },
+    "internal/scanner/scanner.go:IsExecutableBinary": {
+      "end": 123,
+      "lines": 51,
+      "start": 73
+    },
+    "internal/scanner/scanner.go:IsPackageRegistryInternalPath": {
+      "end": 53,
+      "lines": 10,
+      "start": 44
+    },
+    "internal/scanner/scanner.go:Progress": {
+      "end": 185,
+      "lines": 6,
+      "start": 180
+    },
+    "internal/scanner/scanner.go:ScanLive": {
+      "end": 430,
+      "lines": 244,
+      "start": 187
+    },
+    "internal/scanner/scanner.go:ScanParallelChecked": {
+      "end": 178,
+      "lines": 3,
+      "start": 176
+    },
+    "internal/scanner/scanner.go:canDeleteCandidate": {
+      "end": 434,
+      "lines": 3,
+      "start": 432
+    },
+    "internal/scanner/scanner.go:checkPathIgnored": {
+      "end": 475,
+      "lines": 40,
+      "start": 436
+    },
+    "internal/ui/live.go:ChooseFilesLive": {
+      "end": 116,
+      "lines": 33,
+      "start": 84
+    },
+    "internal/ui/live.go:LiveUpdate": {
+      "end": 20,
+      "lines": 5,
+      "start": 16
+    },
+    "internal/ui/live.go:RunLive": {
+      "end": 82,
+      "lines": 61,
+      "start": 22
+    },
+    "internal/ui/ui.go:CandidatePath": {
+      "end": 31,
+      "lines": 17,
+      "start": 15
+    },
+    "internal/ui/ui.go:FindFzf": {
+      "end": 74,
+      "lines": 7,
+      "start": 68
+    },
+    "internal/ui/ui.go:RenderProgressBar": {
+      "end": 55,
+      "lines": 23,
+      "start": 33
+    },
+    "internal/ui/ui.go:SanitizeTerminalString": {
+      "end": 66,
+      "lines": 10,
+      "start": 57
+    },
+    "internal/ui/ui.go:SelectionTokens": {
+      "end": 165,
+      "lines": 9,
+      "start": 157
+    },
+    "internal/ui/ui.go:fileRows": {
+      "end": 95,
+      "lines": 20,
+      "start": 76
+    },
+    "internal/ui/ui.go:fileSelector": {
+      "end": 123,
+      "lines": 27,
+      "start": 97
+    },
+    "internal/ui/ui.go:selectedFiles": {
+      "end": 155,
+      "lines": 31,
+      "start": 125
+    },
+    "internal/worktree/git.go:Commit": {
+      "end": 20,
+      "lines": 5,
+      "start": 16
+    },
+    "internal/worktree/git.go:List": {
+      "end": 143,
+      "lines": 3,
+      "start": 141
+    },
+    "internal/worktree/git.go:Worktree": {
+      "end": 39,
+      "lines": 18,
+      "start": 22
+    },
+    "internal/worktree/git.go:gitContext": {
+      "end": 82,
+      "lines": 3,
+      "start": 80
+    },
+    "internal/worktree/git.go:gitObjects": {
+      "end": 107,
+      "lines": 24,
+      "start": 84
+    },
+    "internal/worktree/git.go:list": {
+      "end": 204,
+      "lines": 60,
+      "start": 145
+    },
+    "internal/worktree/git.go:parseWorktrees": {
+      "end": 139,
+      "lines": 31,
+      "start": 109
+    },
+    "internal/worktree/git.go:remoteKey": {
+      "end": 78,
+      "lines": 38,
+      "start": 41
+    },
+    "internal/worktree/live.go:ChooseLive": {
+      "end": 46,
+      "lines": 13,
+      "start": 34
+    },
+    "internal/worktree/live.go:ChooseProjectLive": {
+      "end": 73,
+      "lines": 26,
+      "start": 48
+    },
+    "internal/worktree/live.go:progressFooter": {
+      "end": 32,
+      "lines": 13,
+      "start": 20
+    },
+    "internal/worktree/live.go:projectRows": {
+      "end": 129,
+      "lines": 55,
+      "start": 75
+    },
+    "internal/worktree/projects.go:AnalyzeProject": {
+      "end": 306,
+      "lines": 237,
+      "start": 70
+    },
+    "internal/worktree/projects.go:Branch": {
+      "end": 27,
+      "lines": 11,
+      "start": 17
+    },
+    "internal/worktree/projects.go:PrintProject": {
+      "end": 393,
+      "lines": 31,
+      "start": 363
+    },
+    "internal/worktree/projects.go:Project": {
+      "end": 36,
+      "lines": 8,
+      "start": 29
+    },
+    "internal/worktree/projects.go:betterBranch": {
+      "end": 361,
+      "lines": 21,
+      "start": 341
+    },
+    "internal/worktree/projects.go:branchHistory": {
+      "end": 339,
+      "lines": 32,
+      "start": 308
+    },
+    "internal/worktree/projects.go:canonicalRepository": {
+      "end": 62,
+      "lines": 25,
+      "start": 38
+    },
+    "internal/worktree/projects.go:historyNode": {
+      "end": 68,
+      "lines": 5,
+      "start": 64
+    },
+    "internal/worktree/scan.go:DefaultRoots": {
+      "end": 138,
+      "lines": 7,
+      "start": 132
+    },
+    "internal/worktree/scan.go:Discover": {
+      "end": 23,
+      "lines": 3,
+      "start": 21
+    },
+    "internal/worktree/scan.go:DiscoverLive": {
+      "end": 34,
+      "lines": 3,
+      "start": 32
+    },
+    "internal/worktree/scan.go:Progress": {
+      "end": 30,
+      "lines": 6,
+      "start": 25
+    },
+    "internal/worktree/scan.go:Report": {
+      "end": 19,
+      "lines": 6,
+      "start": 14
+    },
+    "internal/worktree/scan.go:scan": {
+      "end": 38,
+      "lines": 3,
+      "start": 36
+    },
+    "internal/worktree/scan.go:scanContext": {
+      "end": 130,
+      "lines": 91,
+      "start": 40
+    },
+    "internal/worktree/ui.go:Groups": {
+      "end": 54,
+      "lines": 39,
+      "start": 16
+    },
+    "internal/worktree/ui.go:projectLabel": {
+      "end": 61,
+      "lines": 6,
+      "start": 56
+    },
+    "internal/worktree/ui.go:repositoryRows": {
+      "end": 102,
+      "lines": 40,
+      "start": 63
+    },
+    "internal/worktree/ui.go:selectedOutput": {
+      "end": 131,
+      "lines": 20,
+      "start": 112
+    },
+    "internal/worktree/ui.go:selectorCommand": {
+      "end": 110,
+      "lines": 7,
+      "start": 104
+    }
+  },
+  "draft_spans": {
+    "progressWithRepeat": {
+      "end": 41,
+      "lines": 16,
+      "start": 26
+    },
+    "sanitizeWithMap": {
+      "end": 24,
+      "lines": 8,
+      "start": 17
+    }
+  },
+  "stdlib_probes": {
+    "progress": {
+      "cases": 11544,
+      "domain": "finite percentages; widths -3 through 20; not an exhaustive equivalence proof",
+      "mismatches": 0
+    },
+    "sanitizer": {
+      "cases": 65800,
+      "mismatches": 0
+    }
+  }
+}

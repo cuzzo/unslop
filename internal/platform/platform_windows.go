@@ -10,7 +10,7 @@ import (
 	"unsafe"
 )
 
-func getStatTimes(info os.FileInfo) (time.Time, time.Time, uint32, bool) {
+func GetStatTimes(info os.FileInfo) (time.Time, time.Time, uint32, bool) {
 	return info.ModTime(), info.ModTime(), 0, false
 }
 
@@ -27,7 +27,7 @@ type byHandleFileInformation struct {
 	nFileIndexLow        uint32
 }
 
-func getFileIdentity(path string, info os.FileInfo) (uint64, uint64, bool) {
+func GetFileIdentity(path string, info os.FileInfo) (uint64, uint64, bool) {
 	pathPtr, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, 0, false
@@ -65,7 +65,7 @@ func getDeviceIDFromInfo(fi os.FileInfo) (uint64, error) {
 	return 0, nil
 }
 
-func getDiskSpaceSyscall(path string) (uint64, uint64, uint64, error) {
+func GetDiskSpace(path string) (uint64, uint64, uint64, error) {
 	kernel32 := syscall.NewLazyDLL("kernel32.dll")
 	getDiskFreeSpaceEx := kernel32.NewProc("GetDiskFreeSpaceExW")
 
@@ -89,7 +89,7 @@ func getDiskSpaceSyscall(path string) (uint64, uint64, uint64, error) {
 	return totalNumberOfBytes, used, totalNumberOfFreeBytes, nil
 }
 
-func moveToTrashOS(path string) error {
+func MoveToTrashOS(path string) error {
 	script := `param($p); Add-Type -AssemblyName Microsoft.VisualBasic; if (Test-Path -LiteralPath $p -PathType Container) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p, 'OnlyErrorDialogs', 'SendToRecycleBin') } else { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, 'OnlyErrorDialogs', 'SendToRecycleBin') }`
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script, path)
 	return cmd.Run()
